@@ -5,9 +5,13 @@
 
 use anyhow::Result;
 use image::RgbaImage;
-use svreader_core::commands::{CommandRegistry, ParsedCommand};
+use std::path::PathBuf;
+
+use svreader_core::commands::{CommandRegistry, ParsedCommand, SplitDirection};
 use svreader_core::document::{Document, PageSize};
-use svreader_core::keys::{Key, KeyOutcome, KeyParser, KeyParserState};
+use svreader_core::keys::{
+    ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, Leader, PageDir, WindowOp,
+};
 use svreader_core::{Action, Navigator, Rotation, Viewport, ZoomMode};
 
 struct FakeDoc {
@@ -231,6 +235,10 @@ fn command_registry_parses_all_commands() {
             "cache-size" => "8",
             "prefetch" => "2",
             "colors" => "xterm256",
+            "edit" | "open" => "foo.pdf",
+            "buffer" => "1",
+            "tabmove" => "+1",
+            "resize" | "vresize" => "+2",
             _ => "",
         };
         let line = if arg.is_empty() {
@@ -254,9 +262,237 @@ fn command_registry_completes_prefix() {
 }
 
 #[test]
-fn command_registry_parses_quit_and_help() {
+fn command_registry_parses_window_and_quit() {
     let r = CommandRegistry::default();
-    assert_eq!(r.parse("quit").unwrap(), ParsedCommand::Quit);
-    assert_eq!(r.parse("q").unwrap(), ParsedCommand::Quit);
+    // Vim semantics: :q / :quit close the current window; :qa / :qall
+    // hard-quit the app.
+    assert_eq!(r.parse("q").unwrap(), ParsedCommand::CloseWindow);
+    assert_eq!(r.parse("quit").unwrap(), ParsedCommand::CloseWindow);
+    assert_eq!(r.parse("close").unwrap(), ParsedCommand::CloseWindow);
+    assert_eq!(r.parse("qa").unwrap(), ParsedCommand::Quit);
+    assert_eq!(r.parse("qall").unwrap(), ParsedCommand::Quit);
     assert_eq!(r.parse("help").unwrap(), ParsedCommand::Help);
+}
+
+#[test]
+fn command_registry_parses_splits_and_tabs() {
+    let r = CommandRegistry::default();
+    assert_eq!(
+        r.parse("vsplit").unwrap(),
+        ParsedCommand::Split {
+            direction: SplitDirection::Vertical,
+            file: None,
+        }
+    );
+    assert_eq!(
+        r.parse("vsp foo.pdf").unwrap(),
+        ParsedCommand::Split {
+            direction: SplitDirection::Vertical,
+            file: Some(PathBuf::from("foo.pdf")),
+        }
+    );
+    assert_eq!(
+        r.parse("split bar.pdf").unwrap(),
+        ParsedCommand::Split {
+            direction: SplitDirection::Horizontal,
+            file: Some(PathBuf::from("bar.pdf")),
+        }
+    );
+    assert_eq!(
+        r.parse("tabnew baz.pdf").unwrap(),
+        ParsedCommand::TabNew(Some(PathBuf::from("baz.pdf")))
+    );
+    assert_eq!(r.parse("tabnew").unwrap(), ParsedCommand::TabNew(None));
+    assert_eq!(r.parse("tabclose").unwrap(), ParsedCommand::TabClose);
+    assert_eq!(r.parse("tabonly").unwrap(), ParsedCommand::TabOnly);
+    assert_eq!(r.parse("only").unwrap(), ParsedCommand::OnlyWindow);
+    assert_eq!(
+        r.parse("edit foo.pdf").unwrap(),
+        ParsedCommand::Edit(PathBuf::from("foo.pdf"))
+    );
+    assert_eq!(
+        r.parse("open bar.pdf").unwrap(),
+        ParsedCommand::Edit(PathBuf::from("bar.pdf"))
+    );
+    // :e and :o short forms parse the same way.
+    assert_eq!(
+        r.parse("e quux.pdf").unwrap(),
+        ParsedCommand::Edit(PathBuf::from("quux.pdf"))
+    );
+    assert_eq!(
+        r.parse("o quux.pdf").unwrap(),
+        ParsedCommand::Edit(PathBuf::from("quux.pdf"))
+    );
+    // `:b 3` = :buffer 3
+    assert_eq!(r.parse("b 3").unwrap(), ParsedCommand::Buffer(3));
+}
+
+#[test]
+fn key_parser_ctrl_w_chord() {
+    let mut st = KeyParserState::default();
+    assert_eq!(KeyParser::feed(&mut st, Key::Ctrl('w')), KeyOutcome::Pending);
+    assert_eq!(st.leader, Leader::CtrlW);
+    let out = KeyParser::feed(&mut st, Key::Char('l'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::FocusRight));
+    assert_eq!(st.leader, Leader::None);
+    // <C-w><C-j> — ctrl-prefixed variants are accepted too.
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    let out = KeyParser::feed(&mut st, Key::Ctrl('j'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::FocusDown));
+}
+
+#[test]
+fn key_parser_ctrl_w_split_and_close() {
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::Char('s')),
+        KeyOutcome::Window(WindowOp::SplitHorizontal)
+    );
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::Char('v')),
+        KeyOutcome::Window(WindowOp::SplitVertical)
+    );
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::Char('c')),
+        KeyOutcome::Window(WindowOp::Close)
+    );
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::Char('o')),
+        KeyOutcome::Window(WindowOp::Only)
+    );
+}
+
+#[test]
+fn key_parser_count_with_ctrl_w_resize() {
+    // `3<C-w>+` → grow current window by 3.
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('3'));
+    KeyParser::feed(&mut st, Key::Ctrl('w'));
+    let out = KeyParser::feed(&mut st, Key::Char('+'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::ResizeVertical(3)));
+}
+
+#[test]
+fn key_parser_gt_switches_tabs() {
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('g'));
+    let out = KeyParser::feed(&mut st, Key::Char('t'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::NextTab(1)));
+    // 2gt
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('2'));
+    KeyParser::feed(&mut st, Key::Char('g'));
+    let out = KeyParser::feed(&mut st, Key::Char('t'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::NextTab(2)));
+    // gT
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('g'));
+    let out = KeyParser::feed(&mut st, Key::Char('T'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::PrevTab(1)));
+}
+
+#[test]
+fn key_parser_alternate_buffer() {
+    let mut st = KeyParserState::default();
+    let out = KeyParser::feed(&mut st, Key::Ctrl('^'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::AlternateBuffer));
+    let mut st = KeyParserState::default();
+    let out = KeyParser::feed(&mut st, Key::Ctrl('6'));
+    assert_eq!(out, KeyOutcome::Window(WindowOp::AlternateBuffer));
+}
+
+#[test]
+fn key_parser_alt_arrow_focus_moves() {
+    let mut st = KeyParserState::default();
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::AltArrow(ArrowDir::Left)),
+        KeyOutcome::Window(WindowOp::FocusLeft)
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::AltArrow(ArrowDir::Right)),
+        KeyOutcome::Window(WindowOp::FocusRight)
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::AltArrow(ArrowDir::Up)),
+        KeyOutcome::Window(WindowOp::FocusUp)
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::AltArrow(ArrowDir::Down)),
+        KeyOutcome::Window(WindowOp::FocusDown)
+    );
+}
+
+#[test]
+fn key_parser_shift_alt_arrow_resizes() {
+    let mut st = KeyParserState::default();
+    // Default magnitude is 2.
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::ShiftAltArrow(ArrowDir::Left)),
+        KeyOutcome::Window(WindowOp::ResizeHorizontal(-2))
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::ShiftAltArrow(ArrowDir::Right)),
+        KeyOutcome::Window(WindowOp::ResizeHorizontal(2))
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::ShiftAltArrow(ArrowDir::Up)),
+        KeyOutcome::Window(WindowOp::ResizeVertical(-2))
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::ShiftAltArrow(ArrowDir::Down)),
+        KeyOutcome::Window(WindowOp::ResizeVertical(2))
+    );
+    // Count prefix overrides the default 2.
+    KeyParser::feed(&mut st, Key::Char('5'));
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::ShiftAltArrow(ArrowDir::Right)),
+        KeyOutcome::Window(WindowOp::ResizeHorizontal(5))
+    );
+}
+
+#[test]
+fn key_parser_ctrl_page_switches_tabs() {
+    let mut st = KeyParserState::default();
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::CtrlPage(PageDir::Up)),
+        KeyOutcome::Window(WindowOp::PrevTab(1))
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::CtrlPage(PageDir::Down)),
+        KeyOutcome::Window(WindowOp::NextTab(1))
+    );
+}
+
+#[test]
+fn key_parser_ctrl_shift_page_moves_tab() {
+    let mut st = KeyParserState::default();
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::CtrlShiftPage(PageDir::Up)),
+        KeyOutcome::Window(WindowOp::MoveTabLeft)
+    );
+    assert_eq!(
+        KeyParser::feed(&mut st, Key::CtrlShiftPage(PageDir::Down)),
+        KeyOutcome::Window(WindowOp::MoveTabRight)
+    );
+}
+
+#[test]
+fn command_registry_parses_resize_and_tabmove() {
+    let r = CommandRegistry::default();
+    assert_eq!(r.parse("resize +3").unwrap(), ParsedCommand::Resize(3));
+    assert_eq!(r.parse("resize -3").unwrap(), ParsedCommand::Resize(-3));
+    assert_eq!(r.parse("resize 5").unwrap(), ParsedCommand::Resize(5));
+    assert_eq!(r.parse("vresize -2").unwrap(), ParsedCommand::VResize(-2));
+    // Vim's `:vertical resize N` prefix form.
+    assert_eq!(
+        r.parse("vertical resize +4").unwrap(),
+        ParsedCommand::VResize(4)
+    );
+    assert_eq!(r.parse("tabmove +1").unwrap(), ParsedCommand::TabMove(1));
+    assert_eq!(r.parse("tabmove -1").unwrap(), ParsedCommand::TabMove(-1));
 }

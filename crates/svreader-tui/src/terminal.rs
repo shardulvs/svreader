@@ -24,13 +24,6 @@ pub struct TermGeom {
     pub cell_px_h: u16,
 }
 
-impl TermGeom {
-    pub fn image_px_for_rows(&self, reserved_rows: u16) -> (u32, u32) {
-        let usable_rows = self.rows.saturating_sub(reserved_rows).max(1);
-        let h = (usable_rows as u32) * (self.cell_px_h as u32);
-        (self.px_w as u32, h)
-    }
-}
 
 pub fn query(override_env: Option<&str>) -> Result<TermGeom> {
     let (cols, rows, px_w, px_h) = read_winsize().unwrap_or((80, 24, 0, 0));

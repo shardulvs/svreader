@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use image::RgbaImage;
+use svreader_core::buffer::BufferId;
 use svreader_core::cache::{CacheKey, CachedPage, PageCache};
 use svreader_core::Rotation;
 
 fn key(i: usize) -> CacheKey {
-    CacheKey::new(i, 1.0, 1.0, Rotation::R0)
+    CacheKey::new(BufferId(1), i, 1.0, 1.0, Rotation::R0)
 }
 
 fn page(i: usize) -> Arc<CachedPage> {

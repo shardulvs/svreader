@@ -5,6 +5,7 @@ use image::RgbaImage;
 use lru::LruCache;
 use parking_lot::Mutex;
 
+use crate::buffer::BufferId;
 use crate::viewport::Rotation;
 
 /// Stable key for the rasterised page bitmap. Night mode, quality,
@@ -12,6 +13,7 @@ use crate::viewport::Rotation;
 /// applied at compose time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    pub buffer: BufferId,
     pub page_idx: usize,
     /// Display scale quantised to 1/256 of a unit. Catches legitimate
     /// resolution changes without blowing up on float noise.
@@ -21,8 +23,15 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    pub fn new(page_idx: usize, display_scale: f32, raster_scale: f32, rotation: Rotation) -> Self {
+    pub fn new(
+        buffer: BufferId,
+        page_idx: usize,
+        display_scale: f32,
+        raster_scale: f32,
+        rotation: Rotation,
+    ) -> Self {
         Self {
+            buffer,
             page_idx,
             display_scale_q: (display_scale * 256.0).round().max(0.0) as u32,
             raster_scale_q: (raster_scale * 256.0).round().max(0.0) as u32,

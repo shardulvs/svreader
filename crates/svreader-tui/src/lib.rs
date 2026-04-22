@@ -13,6 +13,8 @@ mod terminal;
 mod timings;
 mod tmux;
 mod ui;
+pub mod window;
+pub mod workspace;
 
 pub mod bench {
     //! Tiny re-exports so examples can benchmark the encoder without

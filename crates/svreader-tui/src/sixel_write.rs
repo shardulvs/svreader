@@ -151,12 +151,23 @@ fn check(status: c_int, ctx: &str) -> Result<()> {
     }
 }
 
-/// Blank a rectangle of the terminal using spaces. Used to clear any
-/// leftover sixel pixels after the image shrinks on resize.
-pub fn blank_rows(start_row: u16, rows: u16, cols: u16, out: &mut impl Write) -> io::Result<()> {
+/// Blank a rectangle bounded by `(col, row)` with `cols` × `rows`
+/// cells. Writes spaces into each affected row rather than using
+/// `\x1b[2K` (which clears the entire row) so neighbouring windows
+/// survive the clear.
+pub fn blank_rect(
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
+    let blanks = " ".repeat(cols as usize);
     for r in 0..rows {
-        write!(out, "\x1b[{};1H\x1b[2K", start_row + r + 1)?;
-        let _ = cols;
+        write!(out, "\x1b[{};{}H{}", row + r + 1, col + 1, blanks)?;
     }
     out.flush()
 }

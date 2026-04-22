@@ -209,7 +209,10 @@ fn cmd_simulate(pdf: PathBuf, keys: String, screen: String, out_dir: PathBuf) ->
                 dump_frame(&doc, &viewport, &out_dir, frame_idx)?;
                 frame_idx += 1;
             }
-            KeyOutcome::Pending | KeyOutcome::OpenCommand | KeyOutcome::ToggleHelp => {}
+            KeyOutcome::Pending
+            | KeyOutcome::OpenCommand
+            | KeyOutcome::ToggleHelp
+            | KeyOutcome::Window(_) => {}
             KeyOutcome::Quit => break,
         }
     }

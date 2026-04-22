@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Result};
 
 use crate::navigator::Action;
@@ -11,6 +13,7 @@ pub enum CommandArg {
     None,
     Number,
     OneOf(Vec<&'static str>),
+    /// Anything — typically a path.
     Free,
 }
 
@@ -22,13 +25,59 @@ pub struct Command {
     pub arg: CommandArg,
 }
 
+/// Orientation for a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
 /// Parsed, executable effect of a command. The TUI executes these —
-/// some need a Navigator action, some are UI-only (quit, help, cache
-/// control), which we'll represent explicitly.
+/// some need a Navigator action, most are window- or workspace-level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedCommand {
     Nav(Action),
+
+    /// Hard-quit the entire application. `:qa`, `:qall`.
     Quit,
+    /// Close the focused window; quit if it's the last one. `:close`, `:q`.
+    CloseWindow,
+    /// Close all other windows in the current tab. `:only`.
+    OnlyWindow,
+
+    /// Split focused window. `file` absent → share current buffer
+    /// (two views of the same PDF).
+    Split {
+        direction: SplitDirection,
+        file: Option<PathBuf>,
+    },
+
+    /// Open/load a file into the current window. `:edit`, `:open`.
+    Edit(PathBuf),
+
+    /// `:tabnew [file]` — new tab, optionally preloaded with a file.
+    TabNew(Option<PathBuf>),
+    /// `:tabclose` — close current tab.
+    TabClose,
+    /// `:tabonly` — close all other tabs.
+    TabOnly,
+
+    /// `:b <n>` — jump to buffer N in the current window.
+    Buffer(usize),
+    /// `:bn` — next buffer in list.
+    BufferNext,
+    /// `:bp` — previous buffer in list.
+    BufferPrev,
+
+    /// `:tabmove ±N` — reorder the current tab relatively. `:tabmove N`
+    /// (no sign) is treated as relative too for simplicity.
+    TabMove(i32),
+    /// `:resize ±N` — adjust the current window's height by N rows.
+    Resize(i32),
+    /// `:vresize ±N` — adjust the current window's width by N cols.
+    /// Also produced by `:vertical resize ±N`.
+    VResize(i32),
+
     Help,
     CacheSet(bool),
     CacheToggle,
@@ -79,12 +128,26 @@ impl CommandRegistry {
     }
 
     /// Parse a full command line like `zoom fit-w` or `goto 42`.
+    ///
+    /// Vim's `:vertical resize N` prefix syntax is supported by
+    /// rewriting to `:vresize N` before dispatch.
     pub fn parse(&self, line: &str) -> Result<ParsedCommand> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Err(anyhow!("empty command"));
         }
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        // Rewrite vim's `:vertical resize N` as `:vresize N`.
+        let rewritten = if let Some(rest) = trimmed.strip_prefix("vertical ") {
+            let rest = rest.trim_start();
+            if let Some(args) = rest.strip_prefix("resize") {
+                format!("vresize{}", args)
+            } else {
+                return Err(anyhow!("only `:vertical resize` is supported"));
+            }
+        } else {
+            trimmed.to_string()
+        };
+        let mut parts = rewritten.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap();
         let arg = parts.next().unwrap_or("").trim();
         let cmd = self
@@ -96,7 +159,54 @@ impl CommandRegistry {
 
 fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
     match cmd.name {
-        "quit" => Ok(ParsedCommand::Quit),
+        "qall" => Ok(ParsedCommand::Quit),
+        "quit" => Ok(ParsedCommand::CloseWindow),
+        "close" => Ok(ParsedCommand::CloseWindow),
+        "only" => Ok(ParsedCommand::OnlyWindow),
+
+        "split" => Ok(ParsedCommand::Split {
+            direction: SplitDirection::Horizontal,
+            file: opt_path(arg),
+        }),
+        "vsplit" => Ok(ParsedCommand::Split {
+            direction: SplitDirection::Vertical,
+            file: opt_path(arg),
+        }),
+        "edit" => {
+            let p = require_path(arg, ":edit wants a path")?;
+            Ok(ParsedCommand::Edit(p))
+        }
+        "open" => {
+            let p = require_path(arg, ":open wants a path")?;
+            Ok(ParsedCommand::Edit(p))
+        }
+
+        "tabnew" => Ok(ParsedCommand::TabNew(opt_path(arg))),
+        "tabclose" => Ok(ParsedCommand::TabClose),
+        "tabonly" => Ok(ParsedCommand::TabOnly),
+
+        "buffer" => {
+            let n: usize = arg
+                .parse()
+                .map_err(|_| anyhow!(":b wants a buffer index"))?;
+            Ok(ParsedCommand::Buffer(n))
+        }
+        "bnext" => Ok(ParsedCommand::BufferNext),
+        "bprev" => Ok(ParsedCommand::BufferPrev),
+
+        "tabmove" => {
+            let n = parse_signed(arg).map_err(|_| anyhow!(":tabmove wants +N, -N, or N"))?;
+            Ok(ParsedCommand::TabMove(n))
+        }
+        "resize" => {
+            let n = parse_signed(arg).map_err(|_| anyhow!(":resize wants +N, -N, or N"))?;
+            Ok(ParsedCommand::Resize(n))
+        }
+        "vresize" => {
+            let n = parse_signed(arg).map_err(|_| anyhow!(":vresize wants +N, -N, or N"))?;
+            Ok(ParsedCommand::VResize(n))
+        }
+
         "help" => Ok(ParsedCommand::Help),
         "goto" => {
             let n: usize = arg.parse().map_err(|_| anyhow!(":goto N requires a number"))?;
@@ -194,11 +304,162 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
     }
 }
 
+/// Parse an integer that may carry a leading `+` or `-` sign. `+N`
+/// and `N` are both treated as positive.
+fn parse_signed(s: &str) -> Result<i32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty"));
+    }
+    if let Some(rest) = s.strip_prefix('+') {
+        let n: i32 = rest.parse()?;
+        Ok(n)
+    } else {
+        let n: i32 = s.parse()?;
+        Ok(n)
+    }
+}
+
+fn opt_path(arg: &str) -> Option<PathBuf> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(expand_home(trimmed)))
+    }
+}
+
+fn require_path(arg: &str, ctx: &'static str) -> Result<PathBuf> {
+    match opt_path(arg) {
+        Some(p) => Ok(p),
+        None => Err(anyhow!(ctx)),
+    }
+}
+
+/// Expand a leading `~/` to `$HOME` so `:e ~/foo.pdf` does what vim
+/// does.
+fn expand_home(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut p = PathBuf::from(home);
+            p.push(rest);
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    s.to_string()
+}
+
 fn all_commands() -> Vec<Command> {
     vec![
+        // Window/tab manipulation first — these are new and discoverable.
+        Command {
+            name: "split",
+            aliases: &["sp"],
+            description: "Horizontal split (optionally open a file)",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "vsplit",
+            aliases: &["vsp"],
+            description: "Vertical split (optionally open a file)",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "close",
+            aliases: &["clo"],
+            description: "Close current window",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "only",
+            aliases: &["on"],
+            description: "Close all other windows in current tab",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "tabnew",
+            aliases: &["tabe"],
+            description: "Open a new tab (optionally with a file)",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "tabclose",
+            aliases: &["tabc"],
+            description: "Close the current tab",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "tabonly",
+            aliases: &["tabo"],
+            description: "Close all other tabs",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "edit",
+            aliases: &["e"],
+            description: "Load file into current window",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "open",
+            aliases: &["o"],
+            description: "Open a file in the current window (same as :edit)",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "buffer",
+            aliases: &["b"],
+            description: "Show buffer N in current window",
+            arg: CommandArg::Number,
+        },
+        Command {
+            name: "bnext",
+            aliases: &["bn"],
+            description: "Next buffer in list",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "bprev",
+            aliases: &["bp"],
+            description: "Previous buffer in list",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "quit",
+            // `:q` is close-window (vim semantics), not quit-app.
+            aliases: &["q"],
+            description: "Close current window (quit if last)",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "tabmove",
+            aliases: &["tabm"],
+            description: "Move current tab by ±N positions",
+            arg: CommandArg::Number,
+        },
+        Command {
+            name: "resize",
+            aliases: &["res"],
+            description: "Adjust current window height by ±N rows",
+            arg: CommandArg::Number,
+        },
+        Command {
+            name: "vresize",
+            aliases: &["vres"],
+            description: "Adjust current window width by ±N cols",
+            arg: CommandArg::Number,
+        },
+        Command {
+            name: "qall",
+            aliases: &["qa", "exit"],
+            description: "Quit svreader",
+            arg: CommandArg::None,
+        },
+
+        // Reading commands (existing).
         Command {
             name: "goto",
-            aliases: &["g", "jump"],
+            aliases: &["jump"],
             description: "Go to page N (1-indexed)",
             arg: CommandArg::Number,
         },
@@ -264,14 +525,8 @@ fn all_commands() -> Vec<Command> {
         },
         Command {
             name: "help",
-            aliases: &["h"],
+            aliases: &[],
             description: "Toggle keybindings overlay",
-            arg: CommandArg::None,
-        },
-        Command {
-            name: "quit",
-            aliases: &["q", "exit"],
-            description: "Exit svreader",
             arg: CommandArg::None,
         },
         Command {
