@@ -1,0 +1,5 @@
+# libsixel (via sixel-sys-static) references libcurl symbols for its
+# HTTP image loaders. We don't use those, but their symbols still need
+# to resolve at link time. Link system libcurl for every binary.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-lcurl"]

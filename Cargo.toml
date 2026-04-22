@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/svreader-core",
+    "crates/svreader-cli",
+    "crates/svreader-tui",
+    ".",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "AGPL-3.0-or-later"
+authors = ["svreader contributors"]
+repository = "https://github.com/svreader/svreader"
+
+[workspace.dependencies]
+svreader-core = { path = "crates/svreader-core" }
+svreader-cli = { path = "crates/svreader-cli" }
+svreader-tui = { path = "crates/svreader-tui" }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+lru = "0.12"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+mupdf = "0.6"
+sixel-bytes = "0.2"
+sixel-sys-static = "0.3"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+unicode-width = "0.2"
+
+[package]
+name = "svreader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "svreader"
+path = "src/main.rs"
+
+[dependencies]
+svreader-tui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

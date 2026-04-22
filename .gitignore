@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+**/target/
+*.rs.bk
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# svreader runtime output
+/tmp/svreader-*.log
