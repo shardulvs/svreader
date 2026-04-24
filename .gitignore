@@ -16,3 +16,6 @@ Thumbs.db
 
 # svreader runtime output
 /tmp/svreader-*.log
+
+# Local design notes — not for publication.
+PLAN.md
