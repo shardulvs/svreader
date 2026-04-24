@@ -546,14 +546,38 @@ fn draw_palette(
     completions: &[String],
     cursor_idx: Option<usize>,
 ) -> Result<()> {
+    // Blank the whole palette area first.
     for r in top..bottom {
         write!(stdout, "\x1b[{};1H\x1b[2K", r + 1)?;
     }
+
+    // Layout: input row at the bottom, completions above it with
+    // index 0 at the top and index N-1 directly above the input. So
+    // `Down` (which increments the index) visually moves the
+    // highlight toward the input, matching user intuition.
     let max_comp = (bottom - top).saturating_sub(1) as usize;
-    for (i, c) in completions.iter().take(max_comp).enumerate() {
-        let row = bottom.saturating_sub(2 + i as u16);
+    let total = completions.len();
+    let visible = max_comp.min(total);
+
+    // Scroll the window so the selected entry is always inside it.
+    // Keeps selection at the bottom of the window once the user
+    // cycles past the last visible row, mirroring readline's menu.
+    let scroll = match cursor_idx {
+        Some(idx) if idx >= visible => idx + 1 - visible,
+        _ => 0,
+    };
+
+    let input_row = bottom.saturating_sub(1);
+    let start_row = input_row.saturating_sub(visible as u16);
+
+    for local_i in 0..visible {
+        let abs_i = scroll + local_i;
+        let Some(c) = completions.get(abs_i) else {
+            break;
+        };
+        let row = start_row + local_i as u16;
         write!(stdout, "\x1b[{};1H", row + 1)?;
-        let selected = Some(i) == cursor_idx;
+        let selected = Some(abs_i) == cursor_idx;
         if selected {
             write!(stdout, "\x1b[7m")?;
         }
@@ -564,7 +588,8 @@ fn draw_palette(
             write!(stdout, "\x1b[0m")?;
         }
     }
-    let input_row = bottom.saturating_sub(1);
+
+    // Input line at the bottom.
     write!(stdout, "\x1b[{};1H", input_row + 1)?;
     let line = format!(":{}", input);
     let truncated: String = line.chars().take(cols as usize).collect();
@@ -711,6 +736,20 @@ fn handle_command_key(
             app.full_repaint = true;
         }
         KeyCode::Enter => {
+            // Two-stage Enter when a completion is highlighted: the
+            // first Enter pastes the selection into the input and
+            // stays in the palette; the second (with nothing
+            // highlighted) executes. Lets the user review a
+            // suggested path before committing.
+            if let Some(idx) = *completion_idx {
+                let completions = compute_completions(input, registry);
+                if let Some(entry) = completions.get(idx) {
+                    input.truncate(entry.replace_from);
+                    input.push_str(&entry.insert);
+                }
+                *completion_idx = None;
+                return Ok(());
+            }
             let line = std::mem::take(input);
             app.mode = Mode::Normal;
             app.full_repaint = true;
@@ -720,37 +759,17 @@ fn handle_command_key(
                 }
             }
         }
-        KeyCode::Tab | KeyCode::BackTab => {
-            let reverse = matches!(k.code, KeyCode::BackTab);
-            let completions = compute_completions(input, registry);
-            if !completions.is_empty() {
-                let idx = match *completion_idx {
-                    None => {
-                        if reverse {
-                            completions.len() - 1
-                        } else {
-                            0
-                        }
-                    }
-                    Some(i) => {
-                        if reverse {
-                            if i == 0 {
-                                completions.len() - 1
-                            } else {
-                                i - 1
-                            }
-                        } else {
-                            (i + 1) % completions.len()
-                        }
-                    }
-                };
-                *completion_idx = Some(idx);
-                // Replace `input[replace_from..]` with the selected
-                // completion's `insert` text.
-                let entry = &completions[idx];
-                input.truncate(entry.replace_from);
-                input.push_str(&entry.insert);
-            }
+        KeyCode::Tab | KeyCode::Down => {
+            cycle_completion(input, completion_idx, registry, false);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            cycle_completion(input, completion_idx, registry, true);
+        }
+        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            cycle_completion(input, completion_idx, registry, false);
+        }
+        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            cycle_completion(input, completion_idx, registry, true);
         }
         KeyCode::Backspace => {
             if !input.is_empty() {
@@ -845,6 +864,45 @@ fn set_message(app: &mut AppState, msg: String) {
     app.chrome_dirty = true;
 }
 
+/// Move the palette's selection highlight forward (or backward, if
+/// `reverse`). The input buffer itself is left alone — a subsequent
+/// Enter commits the selection into `input` without executing.
+///
+/// Shared by `Tab`/`Shift-Tab`, `Down`/`Up`, and `Ctrl-n`/`Ctrl-p`.
+fn cycle_completion(
+    input: &str,
+    completion_idx: &mut Option<usize>,
+    registry: &CommandRegistry,
+    reverse: bool,
+) {
+    let completions = compute_completions(input, registry);
+    if completions.is_empty() {
+        *completion_idx = None;
+        return;
+    }
+    let idx = match *completion_idx {
+        None => {
+            if reverse {
+                completions.len() - 1
+            } else {
+                0
+            }
+        }
+        Some(i) => {
+            if reverse {
+                if i == 0 {
+                    completions.len() - 1
+                } else {
+                    i - 1
+                }
+            } else {
+                (i + 1) % completions.len()
+            }
+        }
+    };
+    *completion_idx = Some(idx);
+}
+
 /// One row in the command palette's completion list.
 #[derive(Debug, Clone)]
 struct PaletteCompletion {
@@ -930,6 +988,18 @@ fn path_completions(arg: &str, replace_from: usize) -> Vec<PaletteCompletion> {
             .file_type()
             .map(|t| t.is_dir())
             .unwrap_or(false);
+        // Only show directories (so the user can drill into them) and
+        // files svreader can actually open. Other files would parse-
+        // fail on `:open`, so hiding them keeps the palette useful.
+        if !is_dir && !is_supported_document(&name) {
+            continue;
+        }
+        // Hide koreader-style `<file>.sdr` sidecar directories — they
+        // only hold `metadata.pdf.lua` and are never something the
+        // user wants to open.
+        if is_dir && name.ends_with(".sdr") {
+            continue;
+        }
         entries.push((name, is_dir));
     }
     // Directories first, then files; alphabetical within each group.
@@ -955,6 +1025,22 @@ fn path_completions(arg: &str, replace_from: usize) -> Vec<PaletteCompletion> {
             }
         })
         .collect()
+}
+
+/// Extensions svreader can open. Extend this list as the Document
+/// backends grow (M4: EPUB, DjVu, CBZ).
+const SUPPORTED_EXTS: &[&str] = &["pdf"];
+
+fn is_supported_document(name: &str) -> bool {
+    let Some(dot) = name.rfind('.') else {
+        return false;
+    };
+    let ext = &name[dot + 1..];
+    if ext.is_empty() {
+        return false;
+    }
+    let lower = ext.to_ascii_lowercase();
+    SUPPORTED_EXTS.iter().any(|e| *e == lower)
 }
 
 /// Split `"foo/bar/ba"` into `("foo/bar/", "ba")`. For inputs without
