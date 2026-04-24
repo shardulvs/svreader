@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     vp.screen_w = w;
     vp.screen_h = h;
 
-    for page in 0..3.min(svreader_core::document::Document::page_count(&doc) as i32) {
+    for page in 0..3.min(svreader_core::PageMetrics::page_count(&doc) as i32) {
         vp.page_idx = page as usize;
         let frame = Renderer::render(&doc, &vp)?;
         let img = frame.composed;

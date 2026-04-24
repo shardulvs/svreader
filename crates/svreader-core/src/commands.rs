@@ -90,11 +90,19 @@ pub enum ParsedCommand {
     CacheSet(bool),
     CacheToggle,
     CacheSize(usize),
+    /// `:ecache on|off|toggle` — controls the encoded-frame cache.
+    ECacheSet(bool),
+    ECacheToggle,
+    /// `:ecache-size N` — sets the encoded-frame cache capacity.
+    ECacheSize(usize),
     Prefetch(usize),
     Reset,
     /// Pick the sixel palette. Grayscale is fastest for text-heavy
     /// PDFs; xterm256 is the default, good for mixed content.
     Colors(ColorPalette),
+    /// `:copy` — copy the focused window's current page to the system
+    /// clipboard as a PNG image.
+    CopyPage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +318,18 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
                 .map_err(|_| anyhow!(":cache-size wants a positive integer"))?;
             Ok(ParsedCommand::CacheSize(n.max(1)))
         }
+        "ecache" => match arg {
+            "on" => Ok(ParsedCommand::ECacheSet(true)),
+            "off" => Ok(ParsedCommand::ECacheSet(false)),
+            "toggle" | "" => Ok(ParsedCommand::ECacheToggle),
+            other => Err(anyhow!(":ecache wants on|off|toggle (got {other:?})")),
+        },
+        "ecache-size" => {
+            let n: usize = arg
+                .parse()
+                .map_err(|_| anyhow!(":ecache-size wants a positive integer"))?;
+            Ok(ParsedCommand::ECacheSize(n.max(1)))
+        }
         "prefetch" => {
             let n: usize = arg
                 .parse()
@@ -321,6 +341,7 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
             "gray" | "grey" | "grayscale" | "g8" => Ok(ParsedCommand::Colors(ColorPalette::Grayscale)),
             other => Err(anyhow!(":colors wants xterm256|gray (got {other:?})")),
         },
+        "copy" => Ok(ParsedCommand::CopyPage),
         other => Err(anyhow!("command {other:?} has no handler")),
     }
 }
@@ -595,7 +616,19 @@ fn all_commands() -> Vec<Command> {
         Command {
             name: "cache-size",
             aliases: &[],
-            description: "Set LRU capacity (pages)",
+            description: "Set RenderCache LRU capacity (pages)",
+            arg: CommandArg::Number,
+        },
+        Command {
+            name: "ecache",
+            aliases: &[],
+            description: "Enable/disable encoded-frame cache",
+            arg: CommandArg::OneOf(vec!["on", "off", "toggle"]),
+        },
+        Command {
+            name: "ecache-size",
+            aliases: &[],
+            description: "Set encoded-frame cache capacity (frames)",
             arg: CommandArg::Number,
         },
         Command {
@@ -609,6 +642,12 @@ fn all_commands() -> Vec<Command> {
             aliases: &[],
             description: "Sixel palette (xterm256 or gray)",
             arg: CommandArg::OneOf(vec!["xterm256", "gray"]),
+        },
+        Command {
+            name: "copy",
+            aliases: &[],
+            description: "Copy current page to clipboard as image",
+            arg: CommandArg::None,
         },
     ]
 }

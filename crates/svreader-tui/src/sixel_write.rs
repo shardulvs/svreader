@@ -5,15 +5,22 @@
 //! quantisation. `sixel-bytes`' convenience API ran ~160ms per frame
 //! at 1920x1080; with `BuiltinDither::G8` for grayscale / XTerm256
 //! for colour, we reach ~10-30ms.
+//!
+//! The encode and the stdout write are split into two public entry
+//! points (`encode_rgba_to_dcs` and `emit_dcs`) so the encoded DCS
+//! payload can be cached by `encoded_cache::ComposedEncodedCache`
+//! and re-emitted without re-encoding.
 
 use std::ffi::{c_int, c_uchar, c_void};
 use std::io::{self, Write};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use image::RgbaImage;
+use parking_lot::Mutex;
 use sixel_sys_static::{
     sixel_dither_get, sixel_dither_set_diffusion_type, sixel_dither_set_pixelformat,
     sixel_encode, sixel_output_destroy, sixel_output_new, sixel_output_set_encode_policy,
@@ -21,6 +28,16 @@ use sixel_sys_static::{
 };
 
 use crate::tmux::wrap_for_tmux;
+
+/// libsixel's `BuiltinDither` is a process-wide singleton, and we
+/// reconfigure its pixel format + diffusion policy before every
+/// encode. Two threads racing on that is unsafe. The ECache filler
+/// runs on a background thread, so this mutex serialises every
+/// encode, ensuring at most one is in flight at a time.
+fn encode_mutex() -> &'static Mutex<()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(()))
+}
 
 pub struct SixelEmitTiming {
     pub encode: Duration,
@@ -30,7 +47,7 @@ pub struct SixelEmitTiming {
 }
 
 /// Colour mode for sixel output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorMode {
     /// 256-colour xterm palette — good default for mixed content.
     XTerm256,
@@ -45,8 +62,46 @@ impl ColorMode {
             ColorMode::Grayscale => BuiltinDither::G8,
         }
     }
+
+    /// Stable 1-byte tag for use in cache keys.
+    pub fn tag(self) -> u8 {
+        match self {
+            ColorMode::XTerm256 => 0,
+            ColorMode::Grayscale => 1,
+        }
+    }
 }
 
+/// Encode an RGBA image to a sixel DCS string using a built-in
+/// palette. Returns the DCS bytes plus the time spent encoding.
+pub fn encode_rgba_to_dcs(image: &RgbaImage, mode: ColorMode) -> Result<(String, Duration)> {
+    let w = image.width() as i32;
+    let h = image.height() as i32;
+    let t0 = Instant::now();
+    let dcs = encode_rgba(image.as_raw(), w, h, mode)?;
+    Ok((dcs, t0.elapsed()))
+}
+
+/// Write an already-encoded sixel DCS string to `out`, positioning
+/// the cursor at `(col, row)` first. Returns the time spent writing
+/// and the byte count placed on the wire.
+pub fn emit_dcs(
+    dcs: &str,
+    col: u16,
+    row: u16,
+    out: &mut impl Write,
+) -> Result<(Duration, usize)> {
+    let t1 = Instant::now();
+    write!(out, "\x1b[{};{}H", row + 1, col + 1)?;
+    let payload = wrap_for_tmux(dcs);
+    out.write_all(payload.as_bytes())?;
+    out.flush()?;
+    Ok((t1.elapsed(), payload.len()))
+}
+
+/// Convenience: encode + emit. Callers that cache the DCS payload
+/// use `encode_rgba_to_dcs` and `emit_dcs` separately so the encode
+/// step can be skipped on a cache hit.
 pub fn encode_and_write(
     image: &RgbaImage,
     col: u16,
@@ -54,25 +109,9 @@ pub fn encode_and_write(
     mode: ColorMode,
     out: &mut impl Write,
 ) -> Result<SixelEmitTiming> {
-    let w = image.width() as i32;
-    let h = image.height() as i32;
-
-    let t0 = Instant::now();
-    let dcs = encode_rgba(image.as_raw(), w, h, mode)?;
-    let encode = t0.elapsed();
-
-    let t1 = Instant::now();
-    write!(out, "\x1b[{};{}H", row + 1, col + 1)?;
-    let payload = wrap_for_tmux(&dcs);
-    out.write_all(payload.as_bytes())?;
-    out.flush()?;
-    let write = t1.elapsed();
-
-    Ok(SixelEmitTiming {
-        encode,
-        write,
-        bytes: dcs.len(),
-    })
+    let (dcs, encode) = encode_rgba_to_dcs(image, mode)?;
+    let (write, bytes) = emit_dcs(&dcs, col, row, out)?;
+    Ok(SixelEmitTiming { encode, write, bytes })
 }
 
 /// Encode RGBA to a sixel DCS string using a built-in palette.
@@ -88,6 +127,9 @@ fn encode_rgba(bytes: &[u8], width: i32, height: i32, mode: ColorMode) -> Result
             expected
         ));
     }
+
+    // Serialise every call into libsixel — see `encode_mutex`.
+    let _guard = encode_mutex().lock();
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let buf_ptr: *mut c_void = &mut buf as *mut _ as *mut c_void;

@@ -22,15 +22,17 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, execute};
-use svreader_core::cache::{CacheKey, CachedPage};
+use svreader_core::cache::CacheKey;
 use svreader_core::keys::{ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, PageDir};
 use svreader_core::{
-    Action, Buffer, ColorPalette, CommandRegistry, Document, ExplorerBuffer, ExplorerKind,
-    PageCache, ParsedCommand, PrefetchRequest, Renderer, Rotation, Viewport, ZoomMode,
+    Action, Buffer, ColorPalette, CommandRegistry, ExplorerBuffer, ExplorerKind, PageMetrics,
+    ParsedCommand, PrefetchRequest, RenderCache, Renderer, Rotation, Viewport, ZoomMode,
 };
 
 use crate::capabilities::{probe_sixel, SIXEL_TERMINALS};
-use crate::sixel_write::{blank_rect, encode_and_write, ColorMode};
+use crate::ecache_fill::{EncCacheFiller, RefillRequest};
+use crate::encoded_cache::{ComposedEncodedCache, EncodedFrame, EncodedKey};
+use crate::sixel_write::{blank_rect, emit_dcs, encode_rgba_to_dcs, ColorMode};
 use crate::terminal::{self, TermGeom};
 use crate::timings::{FrameTiming, TimingsLog};
 use crate::window::{CellRect, WindowId};
@@ -114,7 +116,14 @@ fn run_inner(
         );
     }
 
-    let cache = Arc::new(PageCache::new(5));
+    let cache = Arc::new(RenderCache::new(5));
+    // ECache lives above the RenderCache. Default 10 — small enough
+    // that we don't hold too many encoded strings in memory, big
+    // enough to cover ±4 pages plus the current one without
+    // evicting the current entry while the filler populates the
+    // neighbourhood.
+    let ecache = Arc::new(ComposedEncodedCache::new(10));
+    let ecache_filler = Arc::new(EncCacheFiller::spawn(cache.clone(), ecache.clone())?);
     let initial_body = body_rect(geom, 0); // tab bar not yet rendered
     let (img_w, img_h) = pixel_size(initial_body, geom);
 
@@ -128,11 +137,29 @@ fn run_inner(
     };
     let mut ws = match pdf_path.as_ref() {
         // A directory → open explorer rooted there.
-        Some(p) if p.is_dir() => Workspace::with_explorer(cache.clone(), p, initial_viewport)?,
-        Some(p) => Workspace::with_pdf(cache.clone(), p, initial_viewport)?,
+        Some(p) if p.is_dir() => Workspace::with_explorer(
+            cache.clone(),
+            ecache.clone(),
+            ecache_filler.clone(),
+            p,
+            initial_viewport,
+        )?,
+        Some(p) => Workspace::with_pdf(
+            cache.clone(),
+            ecache.clone(),
+            ecache_filler.clone(),
+            p,
+            initial_viewport,
+        )?,
         None => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            Workspace::with_explorer(cache.clone(), &cwd, initial_viewport)?
+            Workspace::with_explorer(
+                cache.clone(),
+                ecache.clone(),
+                ecache_filler.clone(),
+                &cwd,
+                initial_viewport,
+            )?
         }
     };
 
@@ -211,8 +238,18 @@ fn run_inner(
         // `chrome_dirty` event).
         draw_tab_bar(stdout, &ws, geom)?;
 
+        // Tell the RCache what page the user is on so eviction keeps
+        // the active neighbourhood. Without this, prefetching ±2
+        // past the edges of the cache could evict the page we're
+        // looking at.
+        {
+            let focused = ws.focused_window();
+            ws.cache
+                .set_focus(focused.buffer, focused.viewport.page_idx);
+        }
+
         // Paint windows.
-        paint_windows(stdout, &mut ws, &cache, &timings_log, &layout, geom)?;
+        paint_windows(stdout, &mut ws, &cache, &ecache, &timings_log, &layout, geom)?;
 
         draw_status(stdout, &ws, &app, geom)?;
         app.chrome_dirty = false;
@@ -245,6 +282,27 @@ fn run_inner(
 
         // Fire prefetches around the focused window's page.
         fire_prefetches(&mut ws);
+        // Kick the ECache filler around the focused frame. It'll
+        // only encode pages that are already in the RCache — it
+        // never renders — and stops early if a newer request
+        // arrives (i.e. the user moved again before it finished).
+        fire_ecache_refill(&ws);
+
+        // Drain anything that arrived during paint before we block
+        // again. If the user hammered j five times while we were
+        // painting, we want to process all five keys first and only
+        // paint once, showing the final state — not render five
+        // intermediate frames in sequence.
+        drain_pending_events(
+            stdout,
+            &mut ws,
+            &cache,
+            &ecache,
+            &registry,
+            &mut app,
+            &mut geom,
+            &opts,
+        )?;
 
         let poll_timeout = if app.message_expires.is_some() {
             Duration::from_millis(200)
@@ -270,6 +328,9 @@ fn run_inner(
                 let body = body_rect(geom, tab_bar_rows);
                 ws.propagate_geometry(geom.cell_px_w, geom.cell_px_h, body);
                 cache.clear();
+                // Encoded frames depend on screen dims, so a resize
+                // makes every entry in the ECache stale.
+                ecache.clear();
                 app.full_repaint = true;
             }
             Event::Key(k) => {
@@ -280,7 +341,7 @@ fn run_inner(
                 match app.mode.clone() {
                     Mode::Normal => handle_normal_key(&mut ws, &mut app, k)?,
                     Mode::Command { .. } => {
-                        handle_command_key(&mut ws, &cache, &registry, &mut app, k, stdout)?;
+                        handle_command_key(&mut ws, &cache, &ecache, &registry, &mut app, k, stdout)?;
                     }
                     Mode::Help => {
                         if matches!(k.code, KeyCode::Esc)
@@ -327,7 +388,8 @@ fn pixel_size(rect: CellRect, geom: TermGeom) -> (u32, u32) {
 fn paint_windows(
     stdout: &mut impl Write,
     ws: &mut Workspace,
-    cache: &Arc<PageCache>,
+    cache: &Arc<RenderCache>,
+    ecache: &Arc<ComposedEncodedCache>,
     timings_log: &TimingsLog,
     layout: &[(WindowId, CellRect)],
     geom: TermGeom,
@@ -352,7 +414,7 @@ fn paint_windows(
         if is_explorer {
             paint_explorer_window(stdout, ws, id, rect, geom)?;
         } else {
-            paint_window(stdout, ws, cache, timings_log, id, rect, geom)?;
+            paint_window(stdout, ws, cache, ecache, timings_log, id, rect, geom)?;
         }
     }
     Ok(())
@@ -361,7 +423,8 @@ fn paint_windows(
 fn paint_window(
     stdout: &mut impl Write,
     ws: &mut Workspace,
-    cache: &Arc<PageCache>,
+    cache: &Arc<RenderCache>,
+    ecache: &Arc<ComposedEncodedCache>,
     timings_log: &TimingsLog,
     id: WindowId,
     rect: CellRect,
@@ -395,8 +458,8 @@ fn paint_window(
         return Ok(());
     };
 
-    // Compose viewport + cache key. Borrowed snapshot.
-    let (display_scale, raster_scale, viewport, rotation, page_idx) = {
+    // Compose viewport snapshot. Borrowed from the tree.
+    let (display_scale, raster_scale, viewport, rotation, page_idx, color_mode) = {
         let w = ws.current_tab().tree.find(id).unwrap();
         let page_size = buf.pdf.page_size(w.viewport.page_idx)?;
         let display_scale = w.viewport.display_scale(page_size);
@@ -407,38 +470,77 @@ fn paint_window(
             w.viewport.clone(),
             w.viewport.rotation,
             w.viewport.page_idx,
+            w.color_mode,
         )
     };
-    let key = CacheKey::new(buffer_id, page_idx, display_scale, raster_scale, rotation);
+    let rkey = CacheKey::new(buffer_id, page_idx, display_scale, raster_scale, rotation);
+    let ekey =
+        EncodedKey::from_viewport(buffer_id, &viewport, display_scale, raster_scale, color_mode);
+
+    // Cancel checkpoint: if the ECache already has this exact view
+    // we always finish (the fast path is microseconds). But for the
+    // slow path, we first check if the user already pressed another
+    // key — if so, bail out with dirty=true so the outer loop can
+    // process the input and repaint the new target directly. Keeps
+    // us from spending 100+ ms encoding a frame the user no longer
+    // cares about.
+    if ecache.get(&ekey).is_none() && has_pending_event() {
+        // Leave window state untouched (keeps dirty=true). The outer
+        // loop will process the pending keys and re-enter paint.
+        return Ok(());
+    }
 
     let t_overall = Instant::now();
-    let (page, render_dur) = if let Some(hit) = cache.get(&key) {
-        (hit, Duration::ZERO)
-    } else {
-        let (page, rt) = Renderer::render_page(&buf.pdf, &viewport)?;
-        let arc: Arc<CachedPage> = Arc::new(page);
-        cache.insert(key, arc.clone());
-        (arc, rt.render)
+
+    // Fast path: ECache hit → emit the pre-encoded DCS directly.
+    // Slow path: produce the encoded frame by routing through the
+    // RenderCache (single-flight'd → no duplicate mupdf renders),
+    // then compose + encode. ECache has its own single-flight so
+    // two paint calls for the identical viewport don't re-encode.
+    let (frame, render_dur, compose_dur, encode_dur) = {
+        // Pre-check: is the raster already cached? Used only to
+        // attribute timing ("did this call cost a render?"); the
+        // real guard against duplicate work is get_or_render.
+        let render_was_hot = cache.contains(&rkey);
+        let t_cache_path = Instant::now();
+        let (frame, compose_d, encode_d) = ecache.get_or_encode(ekey, || {
+            let pdf = &buf.pdf;
+            let (page, _page_render_dur) = cache.get_or_render(rkey, || {
+                let (page, rt) = Renderer::render_page(pdf, &viewport)?;
+                Ok((page, rt.render))
+            })?;
+            let (composed, ct) = Renderer::compose(&page, &viewport);
+            let (dcs, encode_dur) = encode_rgba_to_dcs(&composed, color_mode)?;
+            let frame = EncodedFrame {
+                dcs,
+                pixel_height: composed.height(),
+            };
+            Ok((frame, ct.compose, encode_dur))
+        })?;
+        // On an ECache hit the render/compose/encode are all zero.
+        // On an ECache miss where the raster was already in RCache,
+        // bill the time to "compose+encode" not to "render".
+        let total_for_cache_path = t_cache_path.elapsed();
+        let render_dur = if render_was_hot || compose_d == Duration::ZERO {
+            Duration::ZERO
+        } else {
+            // Time spent inside get_or_render that wasn't compose+encode
+            // is the render portion.
+            total_for_cache_path.saturating_sub(compose_d + encode_d)
+        };
+        (frame, render_dur, compose_d, encode_d)
     };
-    let (composed, compose) = Renderer::compose(&page, &viewport);
 
-    let color_mode = ws
-        .current_tab()
-        .tree
-        .find(id)
-        .map(|w| w.color_mode)
-        .unwrap_or(ColorMode::XTerm256);
-
-    let emit = encode_and_write(&composed, image_rect.col, image_rect.row, color_mode, stdout)?;
+    let (write_dur, _bytes) = emit_dcs(&frame.dcs, image_rect.col, image_rect.row, stdout)?;
 
     let total = t_overall.elapsed();
-    let attributed = render_dur + compose.compose + emit.encode + emit.write;
+    let attributed = render_dur + compose_dur + encode_dur + write_dur;
     let other = total.saturating_sub(attributed);
     let timing = FrameTiming {
         render: render_dur,
-        compose: compose.compose,
-        encode: emit.encode,
-        write: emit.write,
+        compose: compose_dur,
+        encode: encode_dur,
+        write: write_dur,
         other,
     };
     timings_log.record(page_idx, &timing);
@@ -451,7 +553,7 @@ fn paint_window(
     let w = ws.current_tab_mut().tree.find_mut(id).unwrap();
     w.last_timing = Some(timing);
     w.last_dpi = effective_dpi;
-    w.last_sixel_rows = (composed.height() as u32).div_ceil(geom.cell_px_h as u32) as u16;
+    w.last_sixel_rows = frame.pixel_height.div_ceil(geom.cell_px_h as u32) as u16;
     w.last_rect = Some(rect);
     w.dirty = false;
     Ok(())
@@ -613,7 +715,8 @@ fn draw_status(
     let row = geom.rows.saturating_sub(STATUS_ROWS);
     let focused = ws.focused_window();
     let buf = ws.buffer(focused.buffer);
-    let cache_stats = ws.cache.stats();
+    let rcache_stats = ws.cache.stats();
+    let ecache_stats = ws.ecache.stats();
 
     let mut s = String::new();
     match buf {
@@ -656,7 +759,10 @@ fn draw_status(
                     (focused.viewport.render_quality * 100.0).round() as i32
                 ));
             }
-            s.push_str(&format!(" cache:{}/{}", cache_stats.0, cache_stats.1));
+            s.push_str(&format!(
+                " RCache:{}/{} ECache:{}/{}",
+                rcache_stats.0, rcache_stats.1, ecache_stats.0, ecache_stats.1
+            ));
             if let Some(t) = &focused.last_timing {
                 s.push(' ');
                 s.push_str(&t.short_label());
@@ -782,6 +888,105 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         if let Some(text) = lines.get(i) {
             let t: String = text.chars().take(cols as usize).collect();
             write!(stdout, "{}", t)?;
+        }
+    }
+    Ok(())
+}
+
+fn fire_ecache_refill(ws: &Workspace) {
+    if !ws.ecache.enabled() {
+        return;
+    }
+    let focused = ws.focused_window();
+    let Some(buf) = ws.buffer_pdf(focused.buffer) else {
+        return;
+    };
+    if buf.page_info.page_count() == 0 {
+        return;
+    }
+    // Radius = how many Navigator steps to walk in each direction.
+    // Capping at (capacity-1)/2 keeps the filler from evicting the
+    // current page while populating neighbours.
+    let (_, cap) = ws.ecache.stats();
+    let radius = cap.saturating_sub(1) / 2;
+    if radius == 0 {
+        return;
+    }
+    let req = RefillRequest::new(
+        focused.buffer,
+        focused.viewport.clone(),
+        focused.color_mode,
+        buf.page_info.clone(),
+        radius,
+    );
+    ws.ecache_filler.request(req);
+}
+
+/// Peek crossterm's event queue without blocking. True means the
+/// main thread has unread input to process. Used inside
+/// `paint_window` as a cancel checkpoint — if a key is already
+/// waiting, we skip the expensive compose+encode so the user's
+/// keypress gets applied sooner.
+fn has_pending_event() -> bool {
+    event::poll(Duration::ZERO).unwrap_or(false)
+}
+
+/// Drain every pending event off the crossterm queue and apply each
+/// one. No painting in between — the outer loop will paint once
+/// after this returns, showing the final state.
+#[allow(clippy::too_many_arguments)]
+fn drain_pending_events(
+    stdout: &mut io::Stdout,
+    ws: &mut Workspace,
+    cache: &Arc<RenderCache>,
+    ecache: &Arc<ComposedEncodedCache>,
+    registry: &CommandRegistry,
+    app: &mut AppState,
+    geom: &mut TermGeom,
+    opts: &RunOptions,
+) -> Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let ev = event::read()?;
+        match ev {
+            Event::Resize(cols, rows) => {
+                let new_geom = terminal::query(opts.screen_px_override.as_deref())
+                    .unwrap_or(TermGeom {
+                        cols,
+                        rows,
+                        px_w: geom.px_w,
+                        px_h: geom.px_h,
+                        cell_px_w: geom.cell_px_w,
+                        cell_px_h: geom.cell_px_h,
+                    });
+                *geom = new_geom;
+                let tab_bar_rows: u16 = if ws.tab_count() > 1 { 1 } else { 0 };
+                let body = body_rect(*geom, tab_bar_rows);
+                ws.propagate_geometry(geom.cell_px_w, geom.cell_px_h, body);
+                cache.clear();
+                ecache.clear();
+                app.full_repaint = true;
+            }
+            Event::Key(k) => {
+                if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
+                match app.mode.clone() {
+                    Mode::Normal => handle_normal_key(ws, app, k)?,
+                    Mode::Command { .. } => {
+                        handle_command_key(ws, cache, ecache, registry, app, k, stdout)?;
+                    }
+                    Mode::Help => {
+                        if matches!(k.code, KeyCode::Esc)
+                            || k.code == KeyCode::Char('?')
+                            || k.code == KeyCode::Char('q')
+                        {
+                            app.mode = Mode::Normal;
+                            app.full_repaint = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -930,7 +1135,8 @@ fn handle_normal_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Res
 
 fn handle_command_key(
     ws: &mut Workspace,
-    cache: &Arc<PageCache>,
+    cache: &Arc<RenderCache>,
+    ecache: &Arc<ComposedEncodedCache>,
     registry: &CommandRegistry,
     app: &mut AppState,
     k: KeyEvent,
@@ -967,7 +1173,7 @@ fn handle_command_key(
             app.mode = Mode::Normal;
             app.full_repaint = true;
             if !line.is_empty() {
-                if let Err(e) = execute_command(ws, cache, app, registry, &line) {
+                if let Err(e) = execute_command(ws, cache, ecache, app, registry, &line) {
                     set_message(app, format!("{e}"));
                 }
             }
@@ -1007,7 +1213,8 @@ fn handle_command_key(
 
 fn execute_command(
     ws: &mut Workspace,
-    cache: &Arc<PageCache>,
+    cache: &Arc<RenderCache>,
+    ecache: &Arc<ComposedEncodedCache>,
     app: &mut AppState,
     registry: &CommandRegistry,
     line: &str,
@@ -1019,18 +1226,33 @@ fn execute_command(
         }
         ParsedCommand::CacheSet(b) => {
             cache.set_enabled(b);
-            set_message(app, format!("cache {}", if b { "on" } else { "off" }));
+            set_message(app, format!("RCache {}", if b { "on" } else { "off" }));
         }
         ParsedCommand::CacheToggle => {
             cache.set_enabled(!cache.enabled());
             set_message(
                 app,
-                format!("cache {}", if cache.enabled() { "on" } else { "off" }),
+                format!("RCache {}", if cache.enabled() { "on" } else { "off" }),
             );
         }
         ParsedCommand::CacheSize(n) => {
             cache.resize(n);
-            set_message(app, format!("cache-size {}", n));
+            set_message(app, format!("RCache size {}", n));
+        }
+        ParsedCommand::ECacheSet(b) => {
+            ecache.set_enabled(b);
+            set_message(app, format!("ECache {}", if b { "on" } else { "off" }));
+        }
+        ParsedCommand::ECacheToggle => {
+            ecache.set_enabled(!ecache.enabled());
+            set_message(
+                app,
+                format!("ECache {}", if ecache.enabled() { "on" } else { "off" }),
+            );
+        }
+        ParsedCommand::ECacheSize(n) => {
+            ecache.resize(n);
+            set_message(app, format!("ECache size {}", n));
         }
         ParsedCommand::Prefetch(n) => {
             set_message(app, format!("prefetch {}", n));
@@ -1044,6 +1266,13 @@ fn execute_command(
             ws.apply_nav(Action::SetRotation(Rotation::R0), 1)?;
             ws.apply_nav(Action::SetZoom(ZoomMode::FitWidth), 1)?;
             cache.clear();
+            ecache.clear();
+        }
+        ParsedCommand::CopyPage => {
+            match copy_current_page_to_clipboard(ws) {
+                Ok(tool) => set_message(app, format!("copied page to clipboard ({tool})")),
+                Err(e) => set_message(app, format!("copy failed: {e}")),
+            }
         }
         ParsedCommand::Colors(p) => {
             let color = match p {
@@ -1352,4 +1581,88 @@ fn crossterm_to_key(k: KeyEvent) -> Option<Key> {
         _ => return None,
     };
     Some(key)
+}
+
+/// Render the focused window's current page and push the PNG bytes to
+/// the system clipboard. Uses the full rasterised page (not the
+/// scroll-cropped view and without night-mode inversion) so the
+/// clipboard receives a clean copy of the PDF page at the current
+/// zoom/rotation. Returns the name of the clipboard tool that worked.
+fn copy_current_page_to_clipboard(ws: &Workspace) -> Result<&'static str> {
+    use anyhow::anyhow;
+    let win = ws.focused_window();
+    let Some(buf) = ws.buffer_pdf(win.buffer) else {
+        return Err(anyhow!("not a PDF buffer"));
+    };
+    let (page, _) = Renderer::render_page(&buf.pdf, &win.viewport)?;
+    let mut png = Vec::new();
+    {
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                page.image.as_raw(),
+                page.image.width(),
+                page.image.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .context("png encode failed")?;
+    }
+    pipe_to_clipboard(&png)
+}
+
+/// Try the available clipboard tools in order and pipe `data` to the
+/// first one that works. On Wayland prefer `wl-copy`; fall back to
+/// X11 tools. Returns the name of the tool that succeeded.
+fn pipe_to_clipboard(data: &[u8]) -> Result<&'static str> {
+    use std::process::{Command as StdCommand, Stdio};
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut tools: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    if wayland {
+        tools.push(("wl-copy", vec!["--type", "image/png"]));
+        tools.push(("xclip", vec!["-selection", "clipboard", "-t", "image/png"]));
+    } else {
+        tools.push(("xclip", vec!["-selection", "clipboard", "-t", "image/png"]));
+        tools.push(("wl-copy", vec!["--type", "image/png"]));
+    }
+
+    let mut last_err: Option<String> = None;
+    for (name, args) in tools {
+        let spawn = StdCommand::new(name)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match spawn {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            if let Err(e) = stdin.write_all(data) {
+                last_err = Some(format!("{name}: write: {e}"));
+                let _ = child.kill();
+                continue;
+            }
+        }
+        // Drop stdin to close the pipe, then wait.
+        drop(child.stdin.take());
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(name),
+            Ok(status) => {
+                last_err = Some(format!("{name}: exit {status}"));
+            }
+            Err(e) => {
+                last_err = Some(format!("{name}: wait: {e}"));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no clipboard tool worked (install wl-clipboard or xclip){}",
+        last_err
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default()
+    ))
 }

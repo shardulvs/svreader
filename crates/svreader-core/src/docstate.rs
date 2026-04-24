@@ -70,6 +70,12 @@ pub struct DocState {
     pub render_dpi: Option<f32>,
     pub render_quality: f32,
     pub cache_enabled: bool,
+    /// RenderCache capacity the user wants. `None` → use the
+    /// default. Last-loaded PDF's value wins because the caches are
+    /// workspace-global.
+    pub cache_size: Option<usize>,
+    /// ECache (encoded-frame cache) capacity.
+    pub ecache_size: Option<usize>,
     /// Extra keys we don't understand, preserved verbatim so we don't
     /// trample koreader-only fields like bookmarks/annotations.
     extras: LuaTable,
@@ -87,6 +93,8 @@ impl Default for DocState {
             render_dpi: None,
             render_quality: 1.0,
             cache_enabled: true,
+            cache_size: None,
+            ecache_size: None,
             extras: LuaTable::default(),
         }
     }
@@ -167,6 +175,14 @@ impl DocState {
                 ("render_dpi", LuaValue::Nil) => st.render_dpi = None,
                 ("render_quality", LuaValue::Number(n)) => st.render_quality = *n as f32,
                 ("cache_enabled", LuaValue::Bool(b)) => st.cache_enabled = *b,
+                ("cache_size", LuaValue::Number(n)) => {
+                    let v = (*n as i64).max(1) as usize;
+                    st.cache_size = Some(v);
+                }
+                ("ecache_size", LuaValue::Number(n)) => {
+                    let v = (*n as i64).max(1) as usize;
+                    st.ecache_size = Some(v);
+                }
                 _ => {}
             }
         }
@@ -182,6 +198,8 @@ impl DocState {
             "render_dpi",
             "render_quality",
             "cache_enabled",
+            "cache_size",
+            "ecache_size",
         ] {
             extras.remove(key);
         }
@@ -210,6 +228,14 @@ impl DocState {
         }
         tbl.set("render_quality", LuaValue::Number(self.render_quality as f64));
         tbl.set("cache_enabled", LuaValue::Bool(self.cache_enabled));
+        match self.cache_size {
+            Some(n) => tbl.set("cache_size", LuaValue::Number(n as f64)),
+            None => tbl.remove("cache_size"),
+        }
+        match self.ecache_size {
+            Some(n) => tbl.set("ecache_size", LuaValue::Number(n as f64)),
+            None => tbl.remove("ecache_size"),
+        }
     }
 }
 

@@ -7,6 +7,8 @@
 //! crate's job is to be boring.
 
 mod capabilities;
+pub mod ecache_fill;
+pub mod encoded_cache;
 mod render_loop;
 mod sixel_write;
 mod terminal;

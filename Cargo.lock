@@ -1057,7 +1057,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
- "lru",
  "mupdf",
  "parking_lot",
  "serde",
@@ -1074,6 +1073,7 @@ dependencies = [
  "crossterm",
  "image",
  "libc",
+ "lru",
  "parking_lot",
  "sixel-bytes",
  "sixel-sys-static",

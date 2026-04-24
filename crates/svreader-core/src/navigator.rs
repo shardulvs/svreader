@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::document::{Document, PageSize};
+use crate::document::{PageMetrics, PageSize};
 use crate::viewport::{Rotation, Viewport, ZoomMode};
 
 /// Fraction of the screen kept visible when a `j`/`k` scroll crosses
@@ -47,8 +47,8 @@ pub struct Navigator;
 impl Navigator {
     /// Apply an action against a document and mutate `viewport`.
     /// Pure state transition — no rendering happens here.
-    pub fn apply<D: Document>(
-        doc: &D,
+    pub fn apply<M: PageMetrics + ?Sized>(
+        doc: &M,
         viewport: &mut Viewport,
         action: Action,
     ) -> Result<()> {
@@ -138,7 +138,7 @@ enum Anchor {
     End,
 }
 
-fn composed_or_zero<D: Document>(doc: &D, viewport: &Viewport) -> Result<(u32, u32, PageSize)> {
+fn composed_or_zero<M: PageMetrics + ?Sized>(doc: &M, viewport: &Viewport) -> Result<(u32, u32, PageSize)> {
     let size = doc.page_size(viewport.page_idx)?;
     let (w, h) = viewport.composed_page_size(size);
     Ok((w, h, size))
@@ -154,7 +154,7 @@ fn snap_to_zoom_anchor(viewport: &mut Viewport, size: PageSize) {
     viewport.y_off = ymin;
 }
 
-fn next_screen<D: Document>(doc: &D, viewport: &mut Viewport) -> Result<()> {
+fn next_screen<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport) -> Result<()> {
     let (pw, ph, size) = composed_or_zero(doc, viewport)?;
     let (_, ymax) = viewport.y_range(ph);
     let fits = viewport.page_fits(size);
@@ -180,7 +180,7 @@ fn next_screen<D: Document>(doc: &D, viewport: &mut Viewport) -> Result<()> {
     Ok(())
 }
 
-fn prev_screen<D: Document>(doc: &D, viewport: &mut Viewport) -> Result<()> {
+fn prev_screen<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport) -> Result<()> {
     let (_, ph, size) = composed_or_zero(doc, viewport)?;
     let (ymin, _) = viewport.y_range(ph);
     let fits = viewport.page_fits(size);
@@ -202,7 +202,7 @@ fn prev_screen<D: Document>(doc: &D, viewport: &mut Viewport) -> Result<()> {
     Ok(())
 }
 
-fn half_screen<D: Document>(doc: &D, viewport: &mut Viewport, dir: i32) -> Result<()> {
+fn half_screen<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport, dir: i32) -> Result<()> {
     let (_, ph, size) = composed_or_zero(doc, viewport)?;
     let (ymin, ymax) = viewport.y_range(ph);
     if viewport.page_fits(size) {
@@ -226,7 +226,7 @@ fn half_screen<D: Document>(doc: &D, viewport: &mut Viewport, dir: i32) -> Resul
     Ok(())
 }
 
-fn scroll_horiz<D: Document>(doc: &D, viewport: &mut Viewport, dir: i32) -> Result<()> {
+fn scroll_horiz<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport, dir: i32) -> Result<()> {
     let (pw, _, _) = composed_or_zero(doc, viewport)?;
     let (xmin, xmax) = viewport.x_range(pw);
     let step = ((viewport.screen_w as f32) * (1.0 - SCROLL_OVERLAP)).round() as i32;
@@ -235,14 +235,14 @@ fn scroll_horiz<D: Document>(doc: &D, viewport: &mut Viewport, dir: i32) -> Resu
     Ok(())
 }
 
-fn goto_anchor<D: Document>(doc: &D, viewport: &mut Viewport, anchor: Anchor) -> Result<()> {
+fn goto_anchor<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport, anchor: Anchor) -> Result<()> {
     let size = doc.page_size(viewport.page_idx)?;
     apply_anchor(viewport, size, anchor);
     Ok(())
 }
 
-fn goto_page<D: Document>(
-    doc: &D,
+fn goto_page<M: PageMetrics + ?Sized>(
+    doc: &M,
     viewport: &mut Viewport,
     page_idx: usize,
     anchor: Anchor,

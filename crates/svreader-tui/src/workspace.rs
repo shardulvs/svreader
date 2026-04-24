@@ -14,10 +14,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use svreader_core::keys::WindowOp;
 use svreader_core::{
-    Action, Buffer, BufferId, BufferIdSource, Document, ExplorerBuffer, Navigator, PageCache,
-    ParsedCommand, PdfBuffer, SplitDirection, Viewport,
+    Action, Buffer, BufferId, BufferIdSource, ExplorerBuffer, Navigator, PageMetrics,
+    ParsedCommand, PdfBuffer, RenderCache, SplitDirection, Viewport,
 };
 
+use crate::ecache_fill::EncCacheFiller;
+use crate::encoded_cache::ComposedEncodedCache;
 use crate::window::{
     Axis, CellRect, CloseOutcome, Direction, Window, WindowId, WindowIdSource, WindowTree,
 };
@@ -64,7 +66,7 @@ impl BufferPool {
         &mut self,
         id_src: &BufferIdSource,
         path: impl AsRef<Path>,
-        cache: Arc<PageCache>,
+        cache: Arc<RenderCache>,
     ) -> Result<BufferId> {
         let raw_path = path.as_ref().to_path_buf();
         let key_path = raw_path
@@ -175,7 +177,9 @@ pub struct Workspace {
     current_tab: usize,
     win_ids: WindowIdSource,
     buf_ids: BufferIdSource,
-    pub cache: Arc<PageCache>,
+    pub cache: Arc<RenderCache>,
+    pub ecache: Arc<ComposedEncodedCache>,
+    pub ecache_filler: Arc<EncCacheFiller>,
     /// Set by `:q`/`:qa` to break the outer event loop.
     pub quit_requested: bool,
     /// Transient message bubble for the status bar.
@@ -189,31 +193,46 @@ impl Workspace {
     /// Construct a workspace seeded with one PDF in one window in
     /// one tab.
     pub fn with_pdf(
-        cache: Arc<PageCache>,
+        cache: Arc<RenderCache>,
+        ecache: Arc<ComposedEncodedCache>,
+        ecache_filler: Arc<EncCacheFiller>,
         path: impl AsRef<Path>,
         viewport: Viewport,
     ) -> Result<Self> {
         let buf_ids = BufferIdSource::new();
         let mut pool = BufferPool::new();
         let id = pool.open_pdf(&buf_ids, path, cache.clone())?;
-        Self::finish_bootstrap(cache, pool, buf_ids, id, viewport)
+        // Apply sidecar-saved cache sizes, if any.
+        if let Some(Buffer::Pdf(pdf)) = pool.get(id) {
+            if let Some(n) = pdf.state.cache_size {
+                cache.resize(n);
+            }
+            if let Some(n) = pdf.state.ecache_size {
+                ecache.resize(n);
+            }
+        }
+        Self::finish_bootstrap(cache, ecache, ecache_filler, pool, buf_ids, id, viewport)
     }
 
     /// Construct a workspace seeded with an explorer rooted at `cwd`.
     /// Used when `svreader` is launched with no arguments.
     pub fn with_explorer(
-        cache: Arc<PageCache>,
+        cache: Arc<RenderCache>,
+        ecache: Arc<ComposedEncodedCache>,
+        ecache_filler: Arc<EncCacheFiller>,
         cwd: impl AsRef<Path>,
         viewport: Viewport,
     ) -> Result<Self> {
         let buf_ids = BufferIdSource::new();
         let mut pool = BufferPool::new();
         let id = pool.open_explorer(&buf_ids, cwd)?;
-        Self::finish_bootstrap(cache, pool, buf_ids, id, viewport)
+        Self::finish_bootstrap(cache, ecache, ecache_filler, pool, buf_ids, id, viewport)
     }
 
     fn finish_bootstrap(
-        cache: Arc<PageCache>,
+        cache: Arc<RenderCache>,
+        ecache: Arc<ComposedEncodedCache>,
+        ecache_filler: Arc<EncCacheFiller>,
         pool: BufferPool,
         buf_ids: BufferIdSource,
         buffer: BufferId,
@@ -230,6 +249,8 @@ impl Workspace {
             win_ids,
             buf_ids,
             cache,
+            ecache,
+            ecache_filler,
             quit_requested: false,
             message: None,
             last_rect: CellRect {
@@ -432,6 +453,8 @@ impl Workspace {
             return;
         };
         let cache_enabled = self.cache.enabled();
+        let (_, cache_cap) = self.cache.stats();
+        let (_, ecache_cap) = self.ecache.stats();
         if let Some(Buffer::Pdf(pdf)) = self.pool.get_mut(buf_id) {
             pdf.state.last_page = vp.page_idx;
             pdf.state.zoom = vp.zoom;
@@ -442,6 +465,24 @@ impl Workspace {
             pdf.state.render_dpi = vp.render_dpi;
             pdf.state.render_quality = vp.render_quality;
             pdf.state.cache_enabled = cache_enabled;
+            pdf.state.cache_size = Some(cache_cap);
+            pdf.state.ecache_size = Some(ecache_cap);
+        }
+    }
+
+    /// Apply the cache-size fields from a PDF buffer's sidecar to
+    /// the workspace-global caches. Called whenever a new PDF buffer
+    /// is opened — last-opened wins, matching the user's stated
+    /// intent of "remember the setting in the sidecar."
+    fn apply_cache_sizes_from(&mut self, buffer: BufferId) {
+        let Some(Buffer::Pdf(pdf)) = self.pool.get(buffer) else {
+            return;
+        };
+        if let Some(n) = pdf.state.cache_size {
+            self.cache.resize(n);
+        }
+        if let Some(n) = pdf.state.ecache_size {
+            self.ecache.resize(n);
         }
     }
 
@@ -533,9 +574,11 @@ impl Workspace {
         };
 
         let new_buffer = match file {
-            Some(p) => self
-                .pool
-                .open_pdf(&self.buf_ids, p, self.cache.clone())?,
+            Some(p) => {
+                let id = self.pool.open_pdf(&self.buf_ids, p, self.cache.clone())?;
+                self.apply_cache_sizes_from(id);
+                id
+            }
             None => {
                 // Share the current buffer. Bump its refcount so
                 // closing one window doesn't tear down the doc.
@@ -761,6 +804,7 @@ impl Workspace {
                         let buffer = self
                             .pool
                             .open_pdf(&self.buf_ids, &p, self.cache.clone())?;
+                        self.apply_cache_sizes_from(buffer);
                         // New buffer — use focused window's viewport
                         // as screen-size template, with a fresh zoom
                         // state (seeded by buffer's sidecar).
@@ -821,9 +865,13 @@ impl Workspace {
             | ParsedCommand::CacheSet(_)
             | ParsedCommand::CacheToggle
             | ParsedCommand::CacheSize(_)
+            | ParsedCommand::ECacheSet(_)
+            | ParsedCommand::ECacheToggle
+            | ParsedCommand::ECacheSize(_)
             | ParsedCommand::Prefetch(_)
             | ParsedCommand::Reset
-            | ParsedCommand::Colors(_) => {
+            | ParsedCommand::Colors(_)
+            | ParsedCommand::CopyPage => {
                 // These are handled by the render loop directly (they
                 // touch UI state outside the workspace).
                 Err(anyhow!("__workspace_passthrough__"))
@@ -841,6 +889,7 @@ impl Workspace {
         let new_buf = self
             .pool
             .open_pdf(&self.buf_ids, path, self.cache.clone())?;
+        self.apply_cache_sizes_from(new_buf);
         let idx = self.current_tab;
         let focused_id = self.tabs[idx].focused;
         let old_buf = {
@@ -963,6 +1012,7 @@ impl Workspace {
             let new_buf = self
                 .pool
                 .open_pdf(&self.buf_ids, &target_path, self.cache.clone())?;
+            self.apply_cache_sizes_from(new_buf);
             let idx = self.current_tab;
             let old = {
                 let win = self.tabs[idx]

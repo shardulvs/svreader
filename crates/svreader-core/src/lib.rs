@@ -19,12 +19,12 @@ pub use buffer::{
     Buffer, BufferId, BufferIdSource, ExplorerBuffer, ExplorerEntry, ExplorerKind, PdfBuffer,
     EXPLORER_SUPPORTED_EXTS,
 };
-pub use cache::{CacheKey, CachedPage, PageCache};
+pub use cache::{CacheKey, CachedPage, RenderCache};
 pub use commands::{
     ColorPalette, Command, CommandArg, CommandRegistry, ParsedCommand, SplitDirection,
 };
 pub use docstate::DocState;
-pub use document::{Document, Outline, PageSize};
+pub use document::{Document, Outline, PageInfo, PageMetrics, PageSize};
 pub use keys::{
     ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, Leader, PageDir, WindowOp,
 };

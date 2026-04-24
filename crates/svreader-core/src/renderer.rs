@@ -63,6 +63,30 @@ impl Renderer {
         } else {
             resize_rgba(raw, display_scale / raster_scale)
         };
+
+        // Nail the bitmap to the dimensions `composed_page_size`
+        // predicts — mupdf + our resize both involve rounding, and
+        // downstream consumers (Navigator's scroll-range math,
+        // compose, the ECache filler) each independently reconstruct
+        // the "expected" dimensions. A 1-pixel parity drift between
+        // the formulae flips `(page-screen)/2` by one, which pushes
+        // x_off off by one, which produces a different EncodedKey —
+        // so the filler's pre-encoded frame never matches the paint
+        // thread's frame and ECache ends up with duplicate entries
+        // per page. Forcing a final resize here is the cheapest way
+        // to guarantee everyone agrees on dimensions.
+        let (expected_w, expected_h) = viewport.composed_page_size(page_size);
+        let image = if image.width() == expected_w && image.height() == expected_h {
+            image
+        } else {
+            image::imageops::resize(
+                &image,
+                expected_w,
+                expected_h,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+
         let render = start.elapsed();
 
         let cached = CachedPage {

@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
 use mupdf::{Colorspace, Document as MuDocument, Matrix, TextPageFlags};
 
-use crate::document::{Document, Outline, PageSize};
+use crate::document::{Document, Outline, PageMetrics, PageSize};
 use crate::viewport::Rotation;
 
 /// mupdf-backed PDF. `mupdf` handles are not `Send`/`Sync`, so every
@@ -45,7 +45,7 @@ impl PdfDocument {
     }
 }
 
-impl Document for PdfDocument {
+impl PageMetrics for PdfDocument {
     fn page_count(&self) -> usize {
         self.inner.page_count().unwrap_or(0).max(0) as usize
     }
@@ -61,7 +61,9 @@ impl Document for PdfDocument {
             height: (bounds.y1 - bounds.y0).max(1.0),
         })
     }
+}
 
+impl Document for PdfDocument {
     fn render_page(
         &self,
         page_idx: usize,

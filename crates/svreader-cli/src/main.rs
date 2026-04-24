@@ -9,8 +9,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use svreader_core::keys::{Key, KeyOutcome, KeyParser, KeyParserState};
 use svreader_core::{
-    Action, CommandRegistry, Document, Navigator, ParsedCommand, PdfDocument, Renderer,
-    Rotation, Viewport, ZoomMode,
+    Action, CommandRegistry, Document, Navigator, PageMetrics, ParsedCommand, PdfDocument,
+    Renderer, Rotation, Viewport, ZoomMode,
 };
 
 #[derive(Parser, Debug)]

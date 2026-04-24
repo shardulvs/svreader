@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
 
-use crate::cache::{CacheKey, PageCache};
+use crate::cache::{CacheKey, RenderCache};
 use crate::pdf::PdfDocument;
 use crate::renderer::Renderer;
 use crate::viewport::Viewport;
@@ -30,7 +30,7 @@ enum PrefetchMsg {
 }
 
 impl Prefetcher {
-    pub fn spawn(main_doc: &PdfDocument, cache: Arc<PageCache>) -> Result<Self> {
+    pub fn spawn(main_doc: &PdfDocument, cache: Arc<RenderCache>) -> Result<Self> {
         let path: PathBuf = main_doc.path().to_path_buf();
         let (tx, rx) = mpsc::channel::<PrefetchMsg>();
         let handle = thread::Builder::new()
@@ -72,7 +72,7 @@ impl Drop for Prefetcher {
     }
 }
 
-fn worker_loop(doc: PdfDocument, cache: Arc<PageCache>, rx: Receiver<PrefetchMsg>) {
+fn worker_loop(doc: PdfDocument, cache: Arc<RenderCache>, rx: Receiver<PrefetchMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             PrefetchMsg::Shutdown => break,
@@ -80,16 +80,18 @@ fn worker_loop(doc: PdfDocument, cache: Arc<PageCache>, rx: Receiver<PrefetchMsg
                 if !cache.enabled() {
                     continue;
                 }
-                if cache.contains(&req.key) {
-                    continue;
-                }
-                match Renderer::render_page(&doc, &req.viewport) {
-                    Ok((page, _)) => {
-                        cache.insert(req.key, Arc::new(page));
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "svreader::prefetch", "prefetch failed: {e:#}");
-                    }
+                // `get_or_render` is what prevents prefetch + paint
+                // from racing on the same key. If the paint thread
+                // already started a render for this key, we become a
+                // no-op follower rather than firing a second mupdf
+                // render in parallel.
+                let viewport = req.viewport.clone();
+                let res = cache.get_or_render(req.key, || {
+                    let (page, rt) = Renderer::render_page(&doc, &viewport)?;
+                    Ok((page, rt.render))
+                });
+                if let Err(e) = res {
+                    tracing::warn!(target: "svreader::prefetch", "prefetch failed: {e:#}");
                 }
             }
         }

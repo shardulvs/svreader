@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::cache::PageCache;
+use crate::cache::RenderCache;
 use crate::docstate::DocState;
+use crate::document::PageInfo;
 use crate::pdf::PdfDocument;
 use crate::prefetch::Prefetcher;
 
@@ -106,6 +107,10 @@ pub struct PdfBuffer {
     pub path: PathBuf,
     pub pdf: PdfDocument,
     pub state: DocState,
+    /// `Send` snapshot of page geometry. Cloned cheaply (it's an
+    /// `Arc` inside) and handed to background workers so they can
+    /// run Navigator without holding the mupdf document itself.
+    pub page_info: PageInfo,
     /// Per-buffer prefetcher: owns its own mupdf handle (not `Send`)
     /// and dies with the buffer.
     pub prefetcher: Prefetcher,
@@ -115,17 +120,19 @@ impl PdfBuffer {
     pub fn open(
         id: BufferId,
         path: impl AsRef<Path>,
-        cache: Arc<PageCache>,
+        cache: Arc<RenderCache>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let pdf = PdfDocument::open(&path)?;
         let state = DocState::load(&path).unwrap_or_default();
+        let page_info = PageInfo::from_metrics(&pdf)?;
         let prefetcher = Prefetcher::spawn(&pdf, cache)?;
         Ok(Self {
             id,
             path,
             pdf,
             state,
+            page_info,
             prefetcher,
         })
     }

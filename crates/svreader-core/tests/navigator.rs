@@ -8,7 +8,7 @@ use image::RgbaImage;
 use std::path::PathBuf;
 
 use svreader_core::commands::{CommandRegistry, ParsedCommand, SplitDirection};
-use svreader_core::document::{Document, PageSize};
+use svreader_core::document::{Document, PageMetrics, PageSize};
 use svreader_core::keys::{
     ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, Leader, PageDir, WindowOp,
 };
@@ -18,13 +18,16 @@ struct FakeDoc {
     pages: Vec<PageSize>,
 }
 
-impl Document for FakeDoc {
+impl PageMetrics for FakeDoc {
     fn page_count(&self) -> usize {
         self.pages.len()
     }
     fn page_size(&self, i: usize) -> Result<PageSize> {
         Ok(self.pages[i])
     }
+}
+
+impl Document for FakeDoc {
     fn render_page(&self, _i: usize, _scale: f32, _r: Rotation) -> Result<RgbaImage> {
         // Not exercised by navigator tests.
         Ok(RgbaImage::new(1, 1))
@@ -233,6 +236,8 @@ fn command_registry_parses_all_commands() {
             "quality" => "100",
             "cache" => "on",
             "cache-size" => "8",
+            "ecache" => "on",
+            "ecache-size" => "20",
             "prefetch" => "2",
             "colors" => "xterm256",
             "edit" | "open" => "foo.pdf",
