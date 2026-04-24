@@ -6,8 +6,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "svreader", version, about)]
 struct Cli {
-    /// PDF file to open.
-    pdf: PathBuf,
+    /// PDF file to open, or a directory to browse in the explorer.
+    /// Omit to land in an explorer rooted at the current working
+    /// directory.
+    pdf: Option<PathBuf>,
 
     /// Override terminal pixel size (format: WxH) for debugging.
     #[arg(long, env = "SVREADER_SCREEN_PX")]

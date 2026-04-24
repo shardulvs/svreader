@@ -15,7 +15,10 @@ pub mod prefetch;
 pub mod renderer;
 pub mod viewport;
 
-pub use buffer::{BufferId, BufferIdSource, PdfBuffer};
+pub use buffer::{
+    Buffer, BufferId, BufferIdSource, ExplorerBuffer, ExplorerEntry, ExplorerKind, PdfBuffer,
+    EXPLORER_SUPPORTED_EXTS,
+};
 pub use cache::{CacheKey, CachedPage, PageCache};
 pub use commands::{
     ColorPalette, Command, CommandArg, CommandRegistry, ParsedCommand, SplitDirection,

@@ -25,7 +25,9 @@ pub mod bench {
 use std::path::PathBuf;
 
 pub struct RunOptions {
-    pub pdf: PathBuf,
+    /// PDF to open on startup. `None` drops the user into an explorer
+    /// rooted at the current working directory.
+    pub pdf: Option<PathBuf>,
     pub screen_px_override: Option<String>,
     pub start_page: Option<usize>,
 }

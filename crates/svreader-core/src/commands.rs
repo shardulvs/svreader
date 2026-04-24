@@ -55,6 +55,14 @@ pub enum ParsedCommand {
     /// Open/load a file into the current window. `:edit`, `:open`.
     Edit(PathBuf),
 
+    /// `:Explore [path]` / `:Sexplore` / `:Vexplore`. The optional
+    /// `split` means "make a new split first, then put the explorer
+    /// there"; `None` replaces the current window's buffer.
+    Explore {
+        split: Option<SplitDirection>,
+        path: Option<PathBuf>,
+    },
+
     /// `:tabnew [file]` — new tab, optionally preloaded with a file.
     TabNew(Option<PathBuf>),
     /// `:tabclose` — close current tab.
@@ -180,6 +188,19 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
             let p = require_path(arg, ":open wants a path")?;
             Ok(ParsedCommand::Edit(p))
         }
+
+        "Explore" => Ok(ParsedCommand::Explore {
+            split: None,
+            path: opt_path(arg),
+        }),
+        "Sexplore" => Ok(ParsedCommand::Explore {
+            split: Some(SplitDirection::Horizontal),
+            path: opt_path(arg),
+        }),
+        "Vexplore" => Ok(ParsedCommand::Explore {
+            split: Some(SplitDirection::Vertical),
+            path: opt_path(arg),
+        }),
 
         "tabnew" => Ok(ParsedCommand::TabNew(opt_path(arg))),
         "tabclose" => Ok(ParsedCommand::TabClose),
@@ -375,6 +396,24 @@ fn all_commands() -> Vec<Command> {
             aliases: &["on"],
             description: "Close all other windows in current tab",
             arg: CommandArg::None,
+        },
+        Command {
+            name: "Explore",
+            aliases: &["Ex"],
+            description: "File explorer in current window",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "Sexplore",
+            aliases: &["Sex"],
+            description: "Horizontal split + file explorer",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "Vexplore",
+            aliases: &["Vex"],
+            description: "Vertical split + file explorer",
+            arg: CommandArg::Free,
         },
         Command {
             name: "tabnew",

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use svreader_core::keys::WindowOp;
 use svreader_core::{
-    Action, BufferId, BufferIdSource, Document, Navigator, PageCache, ParsedCommand, PdfBuffer,
-    SplitDirection, Viewport,
+    Action, Buffer, BufferId, BufferIdSource, Document, ExplorerBuffer, Navigator, PageCache,
+    ParsedCommand, PdfBuffer, SplitDirection, Viewport,
 };
 
 use crate::window::{
@@ -35,16 +35,20 @@ impl Tab {
     }
 }
 
-/// All open PDFs. Reference-counted so shared-buffer splits (`:vsplit`
-/// with no argument) work cleanly: the buffer's prefetcher dies when
-/// no window is looking at it any more.
+/// All open buffers, PDF or explorer. Reference-counted so
+/// shared-buffer splits (`:vsplit` with no argument) work cleanly: the
+/// buffer's prefetcher dies when no window is looking at it any more.
+///
+/// PDFs dedupe by canonical path so reopening the same file just bumps
+/// refs. Explorer buffers do not dedupe — each `:Ex` spawns a fresh
+/// one so two windows can browse different directories.
 struct BufferPool {
     by_id: HashMap<BufferId, Slot>,
     by_path: HashMap<PathBuf, BufferId>,
 }
 
 struct Slot {
-    buf: PdfBuffer,
+    buf: Buffer,
     refs: usize,
 }
 
@@ -56,7 +60,7 @@ impl BufferPool {
         }
     }
 
-    fn open(
+    fn open_pdf(
         &mut self,
         id_src: &BufferIdSource,
         path: impl AsRef<Path>,
@@ -75,7 +79,20 @@ impl BufferPool {
         let id = id_src.next();
         let buf = PdfBuffer::open(id, &raw_path, cache)?;
         self.by_path.insert(key_path, id);
-        self.by_id.insert(id, Slot { buf, refs: 1 });
+        self.by_id
+            .insert(id, Slot { buf: Buffer::Pdf(buf), refs: 1 });
+        Ok(id)
+    }
+
+    fn open_explorer(
+        &mut self,
+        id_src: &BufferIdSource,
+        cwd: impl AsRef<Path>,
+    ) -> Result<BufferId> {
+        let id = id_src.next();
+        let buf = ExplorerBuffer::open(id, cwd)?;
+        self.by_id
+            .insert(id, Slot { buf: Buffer::Explorer(buf), refs: 1 });
         Ok(id)
     }
 
@@ -102,16 +119,37 @@ impl BufferPool {
         }
     }
 
-    fn get(&self, id: BufferId) -> Option<&PdfBuffer> {
+    fn get(&self, id: BufferId) -> Option<&Buffer> {
         self.by_id.get(&id).map(|s| &s.buf)
     }
 
-    fn get_mut(&mut self, id: BufferId) -> Option<&mut PdfBuffer> {
+    fn get_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
         self.by_id.get_mut(&id).map(|s| &mut s.buf)
+    }
+
+    fn get_pdf(&self, id: BufferId) -> Option<&PdfBuffer> {
+        self.get(id).and_then(Buffer::as_pdf)
+    }
+
+    fn get_pdf_mut(&mut self, id: BufferId) -> Option<&mut PdfBuffer> {
+        self.get_mut(id).and_then(Buffer::as_pdf_mut)
     }
 
     fn ids(&self) -> Vec<BufferId> {
         let mut ids: Vec<_> = self.by_id.keys().copied().collect();
+        ids.sort_by_key(|i| i.0);
+        ids
+    }
+
+    /// PDF-only ids in insertion order by `BufferId`. Used by `:b`,
+    /// `:bnext`, `:bprev` — explorers shouldn't show up there.
+    fn pdf_ids(&self) -> Vec<BufferId> {
+        let mut ids: Vec<_> = self
+            .by_id
+            .iter()
+            .filter(|(_, s)| matches!(s.buf, Buffer::Pdf(_)))
+            .map(|(id, _)| *id)
+            .collect();
         ids.sort_by_key(|i| i.0);
         ids
     }
@@ -144,9 +182,32 @@ impl Workspace {
     ) -> Result<Self> {
         let buf_ids = BufferIdSource::new();
         let mut pool = BufferPool::new();
-        let id = pool.open(&buf_ids, path, cache.clone())?;
+        let id = pool.open_pdf(&buf_ids, path, cache.clone())?;
+        Self::finish_bootstrap(cache, pool, buf_ids, id, viewport)
+    }
+
+    /// Construct a workspace seeded with an explorer rooted at `cwd`.
+    /// Used when `svreader` is launched with no arguments.
+    pub fn with_explorer(
+        cache: Arc<PageCache>,
+        cwd: impl AsRef<Path>,
+        viewport: Viewport,
+    ) -> Result<Self> {
+        let buf_ids = BufferIdSource::new();
+        let mut pool = BufferPool::new();
+        let id = pool.open_explorer(&buf_ids, cwd)?;
+        Self::finish_bootstrap(cache, pool, buf_ids, id, viewport)
+    }
+
+    fn finish_bootstrap(
+        cache: Arc<PageCache>,
+        pool: BufferPool,
+        buf_ids: BufferIdSource,
+        buffer: BufferId,
+        viewport: Viewport,
+    ) -> Result<Self> {
         let win_ids = WindowIdSource::new();
-        let window = Window::new(win_ids.next(), id, viewport);
+        let window = Window::new(win_ids.next(), buffer, viewport);
         let tree = WindowTree::leaf(window);
         let tab = Tab::new(tree);
         Ok(Self {
@@ -203,12 +264,30 @@ impl Workspace {
             .expect("focused window must exist in current tab")
     }
 
-    pub fn buffer(&self, id: BufferId) -> Option<&PdfBuffer> {
+    pub fn buffer(&self, id: BufferId) -> Option<&Buffer> {
         self.pool.get(id)
     }
 
-    pub fn buffer_mut(&mut self, id: BufferId) -> Option<&mut PdfBuffer> {
+    pub fn buffer_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
         self.pool.get_mut(id)
+    }
+
+    pub fn buffer_pdf(&self, id: BufferId) -> Option<&PdfBuffer> {
+        self.pool.get_pdf(id)
+    }
+
+    pub fn buffer_pdf_mut(&mut self, id: BufferId) -> Option<&mut PdfBuffer> {
+        self.pool.get_pdf_mut(id)
+    }
+
+    /// True when the focused window is currently showing an explorer
+    /// (used by the render loop to route keys).
+    pub fn focused_is_explorer(&self) -> bool {
+        let id = self.focused_window().buffer;
+        self.pool
+            .get(id)
+            .map(Buffer::is_explorer)
+            .unwrap_or(false)
     }
 
     /// Current tab layout in cell coordinates.
@@ -247,7 +326,18 @@ impl Workspace {
         let Some(slot) = self.pool.by_id.get(&buf_id) else {
             return Ok(false);
         };
-        Navigator::apply(&slot.buf.pdf, &mut w.viewport, Action::Resize(img_w, img_h))?;
+        match &slot.buf {
+            Buffer::Pdf(pdf) => {
+                Navigator::apply(&pdf.pdf, &mut w.viewport, Action::Resize(img_w, img_h))?;
+            }
+            Buffer::Explorer(_) => {
+                // Explorers don't care about page geometry — just keep
+                // the new screen dims so a later swap to a PDF buffer
+                // starts with the correct size.
+                w.viewport.screen_w = img_w.max(1);
+                w.viewport.screen_h = img_h.max(1);
+            }
+        }
         Ok(true)
     }
 
@@ -294,7 +384,12 @@ impl Workspace {
         let Some(buf) = self.pool.get(buffer_id) else {
             return Err(anyhow!("buffer {buffer_id:?} no longer in pool"));
         };
-        let doc = &buf.pdf;
+        let Buffer::Pdf(pdf) = buf else {
+            // Explorer buffers have their own input path (see
+            // render_loop). Navigator actions are a no-op here.
+            return Ok(());
+        };
+        let doc = &pdf.pdf;
         let win = self
             .tabs[self.current_tab]
             .tree
@@ -395,7 +490,9 @@ impl Workspace {
         };
 
         let new_buffer = match file {
-            Some(p) => self.pool.open(&self.buf_ids, p, self.cache.clone())?,
+            Some(p) => self
+                .pool
+                .open_pdf(&self.buf_ids, p, self.cache.clone())?,
             None => {
                 // Share the current buffer. Bump its refcount so
                 // closing one window doesn't tear down the doc.
@@ -614,12 +711,13 @@ impl Workspace {
                 self.split_focused(axis, file.as_deref())
             }
             ParsedCommand::Edit(path) => self.edit_focused(&path),
+            ParsedCommand::Explore { split, path } => self.explore(split, path),
             ParsedCommand::TabNew(file) => {
                 let (buffer, template) = match file {
                     Some(p) => {
                         let buffer = self
                             .pool
-                            .open(&self.buf_ids, &p, self.cache.clone())?;
+                            .open_pdf(&self.buf_ids, &p, self.cache.clone())?;
                         // New buffer — use focused window's viewport
                         // as screen-size template, with a fresh zoom
                         // state (seeded by buffer's sidecar).
@@ -691,7 +789,15 @@ impl Workspace {
     }
 
     fn edit_focused(&mut self, path: &Path) -> Result<()> {
-        let new_buf = self.pool.open(&self.buf_ids, path, self.cache.clone())?;
+        // `:edit` / `:open` on a directory drops the user into an
+        // explorer there — the obvious thing to do, and the cheapest
+        // way to let path completion bottom out at a dir.
+        if path.is_dir() {
+            return self.explore(None, Some(path.to_path_buf()));
+        }
+        let new_buf = self
+            .pool
+            .open_pdf(&self.buf_ids, path, self.cache.clone())?;
         let idx = self.current_tab;
         let focused_id = self.tabs[idx].focused;
         let old_buf = {
@@ -713,8 +819,160 @@ impl Workspace {
         Ok(())
     }
 
+    /// Open an explorer window. With `split = Some(_)`, creates the
+    /// split first; with `None`, swaps the current window's buffer.
+    fn explore(
+        &mut self,
+        split: Option<SplitDirection>,
+        path: Option<PathBuf>,
+    ) -> Result<()> {
+        let cwd = match path {
+            Some(p) => p,
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let new_buf = self.pool.open_explorer(&self.buf_ids, &cwd)?;
+        match split {
+            Some(dir) => {
+                let axis = match dir {
+                    SplitDirection::Horizontal => Axis::Horizontal,
+                    SplitDirection::Vertical => Axis::Vertical,
+                };
+                // split_focused would re-open the buffer by path —
+                // do the split by hand so we reuse the explorer we
+                // just opened.
+                let idx = self.current_tab;
+                let focused_id = self.tabs[idx].focused;
+                let viewport_template = self
+                    .tabs[idx]
+                    .tree
+                    .find(focused_id)
+                    .map(|w| w.viewport.clone())
+                    .ok_or_else(|| anyhow!("focused window missing"))?;
+                let new_id = self.win_ids.next();
+                let new_window = Window::new(new_id, new_buf, viewport_template);
+                let ok = self.tabs[idx].tree.split(focused_id, axis, new_window);
+                if !ok {
+                    self.pool.release(new_buf);
+                    return Err(anyhow!("split: focused window not found in tree"));
+                }
+                self.tabs[idx].focused = new_id;
+                self.mark_all_dirty();
+                Ok(())
+            }
+            None => {
+                let idx = self.current_tab;
+                let focused_id = self.tabs[idx].focused;
+                let old = {
+                    let win = self.tabs[idx]
+                        .tree
+                        .find_mut(focused_id)
+                        .ok_or_else(|| anyhow!("focused window missing"))?;
+                    let old = win.buffer;
+                    win.load(new_buf);
+                    old
+                };
+                self.pool.release(old);
+                self.mark_all_dirty();
+                Ok(())
+            }
+        }
+    }
+
+    /// Called when the user hits `Enter`/`l` on an explorer entry.
+    /// Descends into directories or opens the selected PDF into the
+    /// current window.
+    pub fn explorer_activate(&mut self) -> Result<()> {
+        let focused_id = self.current_tab().focused;
+        let buffer_id = {
+            let win = self
+                .current_tab()
+                .tree
+                .find(focused_id)
+                .ok_or_else(|| anyhow!("focused window missing"))?;
+            win.buffer
+        };
+        let (target_path, is_dir) = {
+            let Some(Buffer::Explorer(ex)) = self.pool.get(buffer_id) else {
+                return Ok(());
+            };
+            let Some(entry) = ex.selected_entry() else {
+                return Ok(());
+            };
+            let is_dir = entry.is_dir_like();
+            let Some(path) = ex.selected_path() else {
+                return Ok(());
+            };
+            (path, is_dir)
+        };
+        if is_dir {
+            if let Some(Buffer::Explorer(ex)) = self.pool.get_mut(buffer_id) {
+                ex.set_cwd(target_path)?;
+            }
+            let w = self
+                .current_tab_mut()
+                .tree
+                .find_mut(focused_id)
+                .expect("focused window present");
+            w.dirty = true;
+            Ok(())
+        } else {
+            // Swap the focused window's buffer to the PDF.
+            let new_buf = self
+                .pool
+                .open_pdf(&self.buf_ids, &target_path, self.cache.clone())?;
+            let idx = self.current_tab;
+            let old = {
+                let win = self.tabs[idx]
+                    .tree
+                    .find_mut(focused_id)
+                    .expect("focused window present");
+                let old = win.buffer;
+                win.load(new_buf);
+                old
+            };
+            self.pool.release(old);
+            self.seed_viewport_from_buffer(focused_id, new_buf);
+            Ok(())
+        }
+    }
+
+    /// `-` / `u` / `h` / Backspace inside an explorer.
+    pub fn explorer_parent(&mut self) -> Result<()> {
+        let id = self.focused_window().buffer;
+        if let Some(Buffer::Explorer(ex)) = self.pool.get_mut(id) {
+            ex.parent()?;
+        }
+        self.focused_window_mut().dirty = true;
+        Ok(())
+    }
+
+    /// j/k and arrows in an explorer.
+    pub fn explorer_move(&mut self, delta: isize) {
+        let id = self.focused_window().buffer;
+        if let Some(Buffer::Explorer(ex)) = self.pool.get_mut(id) {
+            ex.move_selection(delta);
+        }
+        self.focused_window_mut().dirty = true;
+    }
+
+    pub fn explorer_first(&mut self) {
+        let id = self.focused_window().buffer;
+        if let Some(Buffer::Explorer(ex)) = self.pool.get_mut(id) {
+            ex.goto_first();
+        }
+        self.focused_window_mut().dirty = true;
+    }
+
+    pub fn explorer_last(&mut self) {
+        let id = self.focused_window().buffer;
+        if let Some(Buffer::Explorer(ex)) = self.pool.get_mut(id) {
+            ex.goto_last();
+        }
+        self.focused_window_mut().dirty = true;
+    }
+
     fn show_buffer_n(&mut self, n: usize) -> Result<()> {
-        let ids = self.pool.ids();
+        let ids = self.pool.pdf_ids();
         let target = ids
             .iter()
             .find(|b| b.0 as usize == n)
@@ -725,7 +983,7 @@ impl Workspace {
     }
 
     fn cycle_buffer(&mut self, dir: i32) -> Result<()> {
-        let ids = self.pool.ids();
+        let ids = self.pool.pdf_ids();
         if ids.is_empty() {
             return Err(anyhow!("no open buffers"));
         }
@@ -759,13 +1017,14 @@ impl Workspace {
     }
 
     /// Seed a window's viewport from the target buffer's persisted
-    /// DocState, preserving the current screen dims.
+    /// DocState, preserving the current screen dims. Only meaningful
+    /// for PDF buffers — explorer buffers leave the viewport alone.
     fn seed_viewport_from_buffer(&mut self, window: WindowId, buffer: BufferId) {
-        let Some(buf) = self.pool.get(buffer) else {
+        let Some(pdf) = self.pool.get_pdf(buffer) else {
             return;
         };
-        let state = buf.state.clone();
-        let page_count = buf.pdf.page_count();
+        let state = pdf.state.clone();
+        let page_count = pdf.pdf.page_count();
         let idx = self.current_tab;
         let Some(win) = self.tabs[idx].tree.find_mut(window) else {
             return;
@@ -788,11 +1047,11 @@ impl Workspace {
     }
 
     fn fresh_viewport_for(&self, buffer: BufferId, template: &Viewport) -> Viewport {
-        let Some(buf) = self.pool.get(buffer) else {
+        let Some(pdf) = self.pool.get_pdf(buffer) else {
             return template.clone();
         };
-        let state = &buf.state;
-        let page_count = buf.pdf.page_count();
+        let state = &pdf.state;
+        let page_count = pdf.pdf.page_count();
         Viewport {
             page_idx: state.last_page.min(page_count.saturating_sub(1)),
             x_off: state.scroll_x,
@@ -808,12 +1067,12 @@ impl Workspace {
     }
 
     /// Flush every open buffer's DocState to disk. Called at shutdown
-    /// and on tab/buffer close.
+    /// and on tab/buffer close. Explorer buffers have no state to save.
     pub fn persist_all(&mut self) {
         for id in self.pool.ids() {
-            if let Some(buf) = self.pool.get_mut(id) {
-                if let Err(e) = buf.state.save(&buf.path) {
-                    tracing::warn!("failed to save sidecar for {:?}: {e:#}", buf.path);
+            if let Some(Buffer::Pdf(pdf)) = self.pool.get_mut(id) {
+                if let Err(e) = pdf.state.save(&pdf.path) {
+                    tracing::warn!("failed to save sidecar for {:?}: {e:#}", pdf.path);
                 }
             }
         }

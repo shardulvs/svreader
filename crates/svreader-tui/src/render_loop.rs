@@ -25,8 +25,8 @@ use crossterm::{cursor, execute};
 use svreader_core::cache::{CacheKey, CachedPage};
 use svreader_core::keys::{ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, PageDir};
 use svreader_core::{
-    Action, ColorPalette, CommandRegistry, Document, PageCache, ParsedCommand, PrefetchRequest,
-    Renderer, Rotation, Viewport, ZoomMode,
+    Action, Buffer, ColorPalette, CommandRegistry, Document, ExplorerBuffer, ExplorerKind,
+    PageCache, ParsedCommand, PrefetchRequest, Renderer, Rotation, Viewport, ZoomMode,
 };
 
 use crate::capabilities::{probe_sixel, SIXEL_TERMINALS};
@@ -66,6 +66,14 @@ pub fn run(opts: RunOptions) -> Result<()> {
     res
 }
 
+fn startup_message(pdf_path: Option<&PathBuf>) -> String {
+    match pdf_path {
+        Some(p) if p.is_dir() => format!("svreader — opening explorer at {}...\r\n", p.display()),
+        Some(p) => format!("svreader — loading {}...\r\n", p.display()),
+        None => "svreader — opening explorer...\r\n".into(),
+    }
+}
+
 struct AppState {
     key_state: KeyParserState,
     mode: Mode,
@@ -80,12 +88,12 @@ struct AppState {
 
 fn run_inner(
     opts: RunOptions,
-    pdf_path: PathBuf,
+    pdf_path: Option<PathBuf>,
     stdout: &mut io::Stdout,
 ) -> Result<()> {
     // Loading banner before anything slow.
     write!(stdout, "\x1b[2J\x1b[H")?;
-    write!(stdout, "svreader — loading {}...\r\n", pdf_path.display())?;
+    write!(stdout, "{}", startup_message(pdf_path.as_ref()))?;
     if crate::tmux::in_tmux() {
         write!(
             stdout,
@@ -118,13 +126,24 @@ fn run_inner(
         screen_h: img_h.max(1),
         ..Default::default()
     };
-    let mut ws = Workspace::with_pdf(cache.clone(), &pdf_path, initial_viewport)?;
+    let mut ws = match pdf_path.as_ref() {
+        // A directory → open explorer rooted there.
+        Some(p) if p.is_dir() => Workspace::with_explorer(cache.clone(), p, initial_viewport)?,
+        Some(p) => Workspace::with_pdf(cache.clone(), p, initial_viewport)?,
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Workspace::with_explorer(cache.clone(), &cwd, initial_viewport)?
+        }
+    };
 
-    // Apply the start-page override (after DocState load).
+    // Apply the start-page override (after DocState load). Only
+    // meaningful when opened directly on a PDF; when booted into the
+    // explorer, the focused buffer is an ExplorerBuffer and this is a
+    // no-op.
     if let Some(page) = opts.start_page {
         let idx = page.saturating_sub(1);
         let buf_id = ws.focused_window().buffer;
-        if let Some(buf) = ws.buffer_mut(buf_id) {
+        if let Some(buf) = ws.buffer_pdf_mut(buf_id) {
             let n = buf.pdf.page_count();
             if n > 0 {
                 ws.focused_window_mut().viewport.page_idx = idx.min(n - 1);
@@ -317,16 +336,24 @@ fn paint_windows(
     // tree borrow.
     let layout_map: Vec<(WindowId, CellRect)> = layout.iter().copied().collect();
     for (id, rect) in layout_map {
-        let dirty = ws
-            .current_tab()
-            .tree
-            .find(id)
-            .map(|w| w.dirty || w.last_rect != Some(rect))
-            .unwrap_or(false);
+        let (dirty, is_explorer) = {
+            let Some(w) = ws.current_tab().tree.find(id) else {
+                continue;
+            };
+            let is_explorer = ws
+                .buffer(w.buffer)
+                .map(Buffer::is_explorer)
+                .unwrap_or(false);
+            (w.dirty || w.last_rect != Some(rect), is_explorer)
+        };
         if !dirty {
             continue;
         }
-        paint_window(stdout, ws, cache, timings_log, id, rect, geom)?;
+        if is_explorer {
+            paint_explorer_window(stdout, ws, id, rect, geom)?;
+        } else {
+            paint_window(stdout, ws, cache, timings_log, id, rect, geom)?;
+        }
     }
     Ok(())
 }
@@ -364,7 +391,7 @@ fn paint_window(
     // consistent with the rest of the navigator state machine.
     let _ = ws.resync_window_viewport(id, img_w, img_h)?;
 
-    let Some(buf) = ws.buffer(buffer_id) else {
+    let Some(buf) = ws.buffer_pdf(buffer_id) else {
         return Ok(());
     };
 
@@ -430,6 +457,117 @@ fn paint_window(
     Ok(())
 }
 
+fn paint_explorer_window(
+    stdout: &mut impl Write,
+    ws: &mut Workspace,
+    id: WindowId,
+    rect: CellRect,
+    geom: TermGeom,
+) -> Result<()> {
+    // Blank the previous rect if it moved so stale text doesn't hang
+    // off the new window edge.
+    let buffer_id = {
+        let w = ws
+            .current_tab_mut()
+            .tree
+            .find_mut(id)
+            .expect("window in layout");
+        if let Some(prev) = w.last_rect {
+            if prev != rect {
+                blank_rect(prev.col, prev.row, prev.cols, prev.rows, stdout).ok();
+            }
+        }
+        w.buffer
+    };
+
+    // Update screen dims so a later swap to a PDF has correct size.
+    let (img_w, img_h) = pixel_size(rect, geom);
+    let _ = ws.resync_window_viewport(id, img_w, img_h)?;
+
+    // Always clear the window's rect first so shrinking entry lists
+    // don't leave orphan rows behind.
+    blank_rect(rect.col, rect.row, rect.cols, rect.rows, stdout).ok();
+
+    let Some(Buffer::Explorer(ex)) = ws.buffer(buffer_id) else {
+        return Ok(());
+    };
+    draw_explorer(stdout, ex, rect)?;
+
+    let w = ws.current_tab_mut().tree.find_mut(id).unwrap();
+    w.last_rect = Some(rect);
+    w.dirty = false;
+    Ok(())
+}
+
+/// Draw an explorer buffer into `rect`. Header on the first row,
+/// entries below with the selected entry highlighted.
+fn draw_explorer(
+    stdout: &mut impl Write,
+    ex: &ExplorerBuffer,
+    rect: CellRect,
+) -> Result<()> {
+    let cols = rect.cols as usize;
+    if cols == 0 || rect.rows == 0 {
+        return Ok(());
+    }
+
+    // Header row: current working directory, dim grey.
+    let header_raw = ex.cwd.to_string_lossy().into_owned();
+    let header: String = truncate_cols(&header_raw, cols);
+    write!(
+        stdout,
+        "\x1b[{};{}H\x1b[38;5;244m{}\x1b[0m",
+        rect.row + 1,
+        rect.col + 1,
+        header
+    )?;
+
+    // Entry rows.
+    let list_rows = (rect.rows as usize).saturating_sub(1);
+    if list_rows == 0 {
+        return Ok(());
+    }
+    let total = ex.entries.len();
+    // Scroll so the selected entry stays visible.
+    let scroll = if ex.selected >= list_rows {
+        ex.selected + 1 - list_rows
+    } else {
+        0
+    };
+    let visible = list_rows.min(total.saturating_sub(scroll));
+    for i in 0..visible {
+        let abs = scroll + i;
+        let Some(entry) = ex.entries.get(abs) else {
+            break;
+        };
+        let row = rect.row + 1 + i as u16;
+        let selected = abs == ex.selected;
+        let (style, label) = match entry.kind {
+            ExplorerKind::ParentDir => ("\x1b[1;38;5;110m".to_string(), format!("{}/", entry.name)),
+            ExplorerKind::Dir => ("\x1b[1;38;5;110m".to_string(), format!("{}/", entry.name)),
+            ExplorerKind::Pdf => ("\x1b[38;5;252m".to_string(), entry.name.clone()),
+        };
+        let truncated = truncate_cols(&label, cols);
+        write!(stdout, "\x1b[{};{}H", row + 1, rect.col + 1)?;
+        if selected {
+            write!(stdout, "\x1b[7m")?;
+        }
+        write!(stdout, "{}{}\x1b[0m", style, truncated)?;
+        if selected {
+            write!(stdout, "\x1b[0m")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate a string to at most `cols` display columns. We use the
+/// char count as a cheap approximation; the explorer doesn't render
+/// CJK or emoji filenames any better than that.
+fn truncate_cols(s: &str, cols: usize) -> String {
+    s.chars().take(cols).collect()
+}
+
 fn draw_tab_bar(stdout: &mut impl Write, ws: &Workspace, geom: TermGeom) -> Result<()> {
     if ws.tab_count() <= 1 {
         return Ok(());
@@ -475,39 +613,55 @@ fn draw_status(
     let row = geom.rows.saturating_sub(STATUS_ROWS);
     let focused = ws.focused_window();
     let buf = ws.buffer(focused.buffer);
-    let file_name = buf
-        .map(|b| b.display_name())
-        .unwrap_or_else(|| "document".into());
-    let page_count = buf.map(|b| b.pdf.page_count()).unwrap_or(1);
     let cache_stats = ws.cache.stats();
 
     let mut s = String::new();
-    s.push_str(&format!(
-        " {} | {}/{} | {} | {}\u{00B0}",
-        file_name,
-        focused.viewport.page_idx + 1,
-        page_count.max(1),
-        focused.viewport.zoom.label(),
-        focused.viewport.rotation.degrees(),
-    ));
-    if focused.viewport.night_mode {
-        s.push_str(" [night]");
-    }
-    s.push_str(&format!(
-        " dpi:{}{}",
-        focused.last_dpi.round() as i32,
-        if focused.viewport.render_dpi.is_some() { "*" } else { "" }
-    ));
-    if (focused.viewport.render_quality - 1.0).abs() > 0.005 {
-        s.push_str(&format!(
-            " q:{}%",
-            (focused.viewport.render_quality * 100.0).round() as i32
-        ));
-    }
-    s.push_str(&format!(" cache:{}/{}", cache_stats.0, cache_stats.1));
-    if let Some(t) = &focused.last_timing {
-        s.push(' ');
-        s.push_str(&t.short_label());
+    match buf {
+        Some(Buffer::Explorer(ex)) => {
+            let count = ex.entries.len();
+            s.push_str(&format!(
+                " {} | {}/{} ",
+                ex.display_name(),
+                if count == 0 { 0 } else { ex.selected + 1 },
+                count
+            ));
+            if let Some(e) = ex.selected_entry() {
+                s.push_str(&format!("| {}", e.name));
+            }
+        }
+        _ => {
+            let (file_name, page_count) = match buf {
+                Some(Buffer::Pdf(p)) => (p.display_name(), p.pdf.page_count()),
+                _ => ("document".to_string(), 1),
+            };
+            s.push_str(&format!(
+                " {} | {}/{} | {} | {}\u{00B0}",
+                file_name,
+                focused.viewport.page_idx + 1,
+                page_count.max(1),
+                focused.viewport.zoom.label(),
+                focused.viewport.rotation.degrees(),
+            ));
+            if focused.viewport.night_mode {
+                s.push_str(" [night]");
+            }
+            s.push_str(&format!(
+                " dpi:{}{}",
+                focused.last_dpi.round() as i32,
+                if focused.viewport.render_dpi.is_some() { "*" } else { "" }
+            ));
+            if (focused.viewport.render_quality - 1.0).abs() > 0.005 {
+                s.push_str(&format!(
+                    " q:{}%",
+                    (focused.viewport.render_quality * 100.0).round() as i32
+                ));
+            }
+            s.push_str(&format!(" cache:{}/{}", cache_stats.0, cache_stats.1));
+            if let Some(t) = &focused.last_timing {
+                s.push(' ');
+                s.push_str(&t.short_label());
+            }
+        }
     }
     if ws.current_tab().tree.leaf_count() > 1 {
         s.push_str(&format!(" w:{}", ws.current_tab().tree.leaf_count()));
@@ -617,7 +771,8 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         "   Ctrl-w c / o     close / only",
         "   gt / gT       next / previous tab",
         "   Ctrl-^        alternate buffer",
-        "   :             command palette  (:open, :edit, :split, :tabnew, :q, :qa)",
+        "   (in :Ex)      j/k select, Enter/l open, -/u/h/Backspace parent",
+        "   :             command palette  (:open, :edit, :split, :tabnew, :Ex, :Vex, :q, :qa)",
         "   ?             toggle this help   q   quit",
         "",
         " Press ? or Esc to close.",
@@ -637,7 +792,7 @@ fn fire_prefetches(ws: &mut Workspace) {
         return;
     }
     let focused_buffer = ws.focused_window().buffer;
-    let Some(buf) = ws.buffer(focused_buffer) else {
+    let Some(buf) = ws.buffer_pdf(focused_buffer) else {
         return;
     };
     let count = buf.pdf.page_count();
@@ -681,6 +836,64 @@ fn handle_normal_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Res
         ws.quit_requested = true;
         return Ok(());
     }
+
+    // Explorer windows get first dibs on plain keys (no modifiers, or
+    // just Shift) for list navigation. Anything with Ctrl/Alt, plus
+    // `:`, `?`, `q`, and the `<C-w>` chord still go through the
+    // regular KeyParser below so window operations keep working from
+    // inside an explorer.
+    if ws.focused_is_explorer() {
+        let mods = k.modifiers;
+        let plain = mods.is_empty() || mods == KeyModifiers::SHIFT;
+        if plain {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    ws.explorer_move(1);
+                    return Ok(());
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    ws.explorer_move(-1);
+                    return Ok(());
+                }
+                KeyCode::Char('g') => {
+                    // `gg` inside the explorer jumps to first. Use
+                    // the existing `g` leader so a single `g` still
+                    // pends.
+                    if app.key_state.leader == svreader_core::keys::Leader::G {
+                        app.key_state.clear();
+                        ws.explorer_first();
+                    } else {
+                        app.key_state.leader = svreader_core::keys::Leader::G;
+                    }
+                    app.pending_hint = app.key_state.hint();
+                    return Ok(());
+                }
+                KeyCode::Char('G') => {
+                    app.key_state.clear();
+                    ws.explorer_last();
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                    if let Err(e) = ws.explorer_activate() {
+                        set_message(app, format!("{e}"));
+                    }
+                    return Ok(());
+                }
+                KeyCode::Backspace
+                | KeyCode::Left
+                | KeyCode::Char('h')
+                | KeyCode::Char('-')
+                | KeyCode::Char('u') => {
+                    if let Err(e) = ws.explorer_parent() {
+                        set_message(app, format!("{e}"));
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+
     let Some(key) = crossterm_to_key(k) else {
         return Ok(());
     };
@@ -964,6 +1177,12 @@ fn is_path_command(name: &str) -> bool {
             | "vsp"
             | "tabnew"
             | "tabe"
+            | "Explore"
+            | "Ex"
+            | "Sexplore"
+            | "Sex"
+            | "Vexplore"
+            | "Vex"
     )
 }
 
