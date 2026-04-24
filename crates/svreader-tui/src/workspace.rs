@@ -113,6 +113,19 @@ impl BufferPool {
         };
         if should_drop {
             if let Some(slot) = self.by_id.remove(&id) {
+                // Last ref gone — flush the sidecar before the doc
+                // drops, otherwise viewport state set during the
+                // session is lost (the buffer was about to disappear
+                // anyway, so there's no later `persist_all` to save
+                // it).
+                if let Buffer::Pdf(pdf) = &slot.buf {
+                    if let Err(e) = pdf.state.save(&pdf.path) {
+                        tracing::warn!(
+                            "failed to save sidecar on release for {:?}: {e:#}",
+                            pdf.path
+                        );
+                    }
+                }
                 self.by_path.retain(|_, v| *v != id);
                 drop(slot);
             }
@@ -399,7 +412,37 @@ impl Workspace {
             Navigator::apply(doc, &mut win.viewport, action.clone())?;
         }
         win.dirty = true;
+        // Keep the buffer's sidecar state in sync with the viewport
+        // the user is actually looking at, so a mid-session close /
+        // `:edit` / crash doesn't lose zoom/page/night changes.
+        self.sync_buffer_state_from_window(focused_id);
         Ok(())
+    }
+
+    /// Copy the given window's viewport back into its PDF buffer's
+    /// `DocState`. No-op for explorer buffers or unknown windows.
+    /// Searches all tabs so `persist_all` can fan out without having
+    /// to flip the current-tab pointer.
+    pub fn sync_buffer_state_from_window(&mut self, window: WindowId) {
+        let found = self
+            .tabs
+            .iter()
+            .find_map(|t| t.tree.find(window).map(|w| (w.buffer, w.viewport.clone())));
+        let Some((buf_id, vp)) = found else {
+            return;
+        };
+        let cache_enabled = self.cache.enabled();
+        if let Some(Buffer::Pdf(pdf)) = self.pool.get_mut(buf_id) {
+            pdf.state.last_page = vp.page_idx;
+            pdf.state.zoom = vp.zoom;
+            pdf.state.rotation = vp.rotation;
+            pdf.state.scroll_x = vp.x_off;
+            pdf.state.scroll_y = vp.y_off;
+            pdf.state.night_mode = vp.night_mode;
+            pdf.state.render_dpi = vp.render_dpi;
+            pdf.state.render_quality = vp.render_quality;
+            pdf.state.cache_enabled = cache_enabled;
+        }
     }
 
     // -------------------- window-op dispatch --------------------
@@ -1069,6 +1112,17 @@ impl Workspace {
     /// Flush every open buffer's DocState to disk. Called at shutdown
     /// and on tab/buffer close. Explorer buffers have no state to save.
     pub fn persist_all(&mut self) {
+        // Sync every window's viewport back into its buffer first.
+        // For shared buffers this is last-writer-wins, which matches
+        // vim's single-sidecar-per-file model.
+        let window_ids: Vec<WindowId> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.windows().into_iter().map(|w| w.id))
+            .collect();
+        for id in window_ids {
+            self.sync_buffer_state_from_window(id);
+        }
         for id in self.pool.ids() {
             if let Some(Buffer::Pdf(pdf)) = self.pool.get_mut(id) {
                 if let Err(e) = pdf.state.save(&pdf.path) {
