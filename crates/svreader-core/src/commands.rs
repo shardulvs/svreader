@@ -103,6 +103,20 @@ pub enum ParsedCommand {
     /// `:copy` — copy the focused window's current page to the system
     /// clipboard as a PNG image.
     CopyPage,
+
+    /// `:toc` — toggle the TOC overlay over the focused window.
+    ToggleToc,
+    /// `:marks` / `:bookmarks` — toggle the bookmark list overlay.
+    ToggleMarks,
+    /// `:delmark X` — remove a single mark.
+    DeleteMark(char),
+    /// `:back` — pop the back-stack.
+    JumpBack,
+    /// `:forward` — pop the forward-stack.
+    JumpForward,
+    /// `:mouse on|off|toggle` — control mouse-click capture.
+    MouseSet(bool),
+    MouseToggle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +356,28 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
             other => Err(anyhow!(":colors wants xterm256|gray (got {other:?})")),
         },
         "copy" => Ok(ParsedCommand::CopyPage),
+
+        "toc" => Ok(ParsedCommand::ToggleToc),
+        "marks" => Ok(ParsedCommand::ToggleMarks),
+        "bookmarks" => Ok(ParsedCommand::ToggleMarks),
+        "delmark" => {
+            let c = arg.trim().chars().next().ok_or_else(|| {
+                anyhow!(":delmark wants a single letter (a-z)")
+            })?;
+            if !c.is_ascii_alphabetic() {
+                return Err(anyhow!(":delmark wants a single letter (got {c:?})"));
+            }
+            Ok(ParsedCommand::DeleteMark(c))
+        }
+        "back" => Ok(ParsedCommand::JumpBack),
+        "forward" => Ok(ParsedCommand::JumpForward),
+        "mouse" => match arg {
+            "on" => Ok(ParsedCommand::MouseSet(true)),
+            "off" => Ok(ParsedCommand::MouseSet(false)),
+            "toggle" | "" => Ok(ParsedCommand::MouseToggle),
+            other => Err(anyhow!(":mouse wants on|off|toggle (got {other:?})")),
+        },
+
         other => Err(anyhow!("command {other:?} has no handler")),
     }
 }
@@ -648,6 +684,44 @@ fn all_commands() -> Vec<Command> {
             aliases: &[],
             description: "Copy current page to clipboard as image",
             arg: CommandArg::None,
+        },
+
+        // M2 — structure: TOC, bookmarks, jump list, mouse.
+        Command {
+            name: "toc",
+            aliases: &[],
+            description: "Toggle table-of-contents overlay",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "marks",
+            aliases: &["bookmarks"],
+            description: "Toggle bookmark-list overlay",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "delmark",
+            aliases: &[],
+            description: "Delete a bookmark by letter",
+            arg: CommandArg::Free,
+        },
+        Command {
+            name: "back",
+            aliases: &[],
+            description: "Pop the jump back-stack (Ctrl-o)",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "forward",
+            aliases: &[],
+            description: "Pop the jump forward-stack",
+            arg: CommandArg::None,
+        },
+        Command {
+            name: "mouse",
+            aliases: &[],
+            description: "Mouse capture (on|off|toggle)",
+            arg: CommandArg::OneOf(vec!["on", "off", "toggle"]),
         },
     ]
 }

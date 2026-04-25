@@ -58,6 +58,18 @@ impl LuaTable {
     }
 }
 
+/// One persisted bookmark. Vim-style — single-letter mark + the spot
+/// on the page the user was looking at when they set it (page index
+/// plus current scroll offsets, so jumping back lands at the same
+/// view).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bookmark {
+    pub mark: char,
+    pub page: usize,
+    pub x_off: i32,
+    pub y_off: i32,
+}
+
 /// Persistent per-document reader state.
 #[derive(Debug, Clone)]
 pub struct DocState {
@@ -76,6 +88,14 @@ pub struct DocState {
     pub cache_size: Option<usize>,
     /// ECache (encoded-frame cache) capacity.
     pub ecache_size: Option<usize>,
+    /// Per-document marks set with `m{a-z}` and recalled with
+    /// `'{a-z}`. Stored as a list (not a map) so the on-disk layout
+    /// stays Lua-array-of-tables, simple to round-trip.
+    pub bookmarks: Vec<Bookmark>,
+    /// Whether mouse capture is enabled. Persists across sessions so
+    /// users who turn it off don't keep losing terminal text-select
+    /// every time they reopen a file. None = use the global default.
+    pub mouse_enabled: Option<bool>,
     /// Extra keys we don't understand, preserved verbatim so we don't
     /// trample koreader-only fields like bookmarks/annotations.
     extras: LuaTable,
@@ -95,8 +115,38 @@ impl Default for DocState {
             cache_enabled: true,
             cache_size: None,
             ecache_size: None,
+            bookmarks: Vec::new(),
+            mouse_enabled: None,
             extras: LuaTable::default(),
         }
+    }
+}
+
+impl DocState {
+    /// Set or replace a single-letter mark. Replaces an existing mark
+    /// of the same letter rather than appending a duplicate.
+    pub fn set_bookmark(&mut self, mark: char, page: usize, x_off: i32, y_off: i32) {
+        let bm = Bookmark {
+            mark,
+            page,
+            x_off,
+            y_off,
+        };
+        if let Some(slot) = self.bookmarks.iter_mut().find(|b| b.mark == mark) {
+            *slot = bm;
+        } else {
+            self.bookmarks.push(bm);
+        }
+    }
+
+    pub fn delete_bookmark(&mut self, mark: char) -> bool {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.mark != mark);
+        before != self.bookmarks.len()
+    }
+
+    pub fn find_bookmark(&self, mark: char) -> Option<&Bookmark> {
+        self.bookmarks.iter().find(|b| b.mark == mark)
     }
 }
 
@@ -183,6 +233,31 @@ impl DocState {
                     let v = (*n as i64).max(1) as usize;
                     st.ecache_size = Some(v);
                 }
+                ("mouse_enabled", LuaValue::Bool(b)) => st.mouse_enabled = Some(*b),
+                ("svr_bookmarks", LuaValue::Table(bt)) => {
+                    for (_, entry) in &bt.entries {
+                        let LuaValue::Table(et) = entry else { continue };
+                        let mark = match et.get("mark") {
+                            Some(LuaValue::String(s)) if !s.is_empty() => {
+                                s.chars().next().unwrap()
+                            }
+                            _ => continue,
+                        };
+                        let page = match et.get("page") {
+                            Some(LuaValue::Number(n)) => (*n as i64).max(0) as usize,
+                            _ => continue,
+                        };
+                        let x_off = match et.get("x_off") {
+                            Some(LuaValue::Number(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let y_off = match et.get("y_off") {
+                            Some(LuaValue::Number(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        st.set_bookmark(mark, page, x_off, y_off);
+                    }
+                }
                 _ => {}
             }
         }
@@ -200,6 +275,8 @@ impl DocState {
             "cache_enabled",
             "cache_size",
             "ecache_size",
+            "mouse_enabled",
+            "svr_bookmarks",
         ] {
             extras.remove(key);
         }
@@ -235,6 +312,25 @@ impl DocState {
         match self.ecache_size {
             Some(n) => tbl.set("ecache_size", LuaValue::Number(n as f64)),
             None => tbl.remove("ecache_size"),
+        }
+        match self.mouse_enabled {
+            Some(b) => tbl.set("mouse_enabled", LuaValue::Bool(b)),
+            None => tbl.remove("mouse_enabled"),
+        }
+        if self.bookmarks.is_empty() {
+            tbl.remove("svr_bookmarks");
+        } else {
+            let mut arr = LuaTable::default();
+            for (i, bm) in self.bookmarks.iter().enumerate() {
+                let mut bt = LuaTable::default();
+                bt.set("mark", LuaValue::String(bm.mark.to_string()));
+                bt.set("page", LuaValue::Number(bm.page as f64));
+                bt.set("x_off", LuaValue::Number(bm.x_off as f64));
+                bt.set("y_off", LuaValue::Number(bm.y_off as f64));
+                arr.entries
+                    .push((LuaKey::Int(i as i64 + 1), LuaValue::Table(bt)));
+            }
+            tbl.set("svr_bookmarks", LuaValue::Table(arr));
         }
     }
 }

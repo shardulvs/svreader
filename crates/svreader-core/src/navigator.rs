@@ -38,6 +38,16 @@ pub enum Action {
 
     Resize(u32, u32),
 
+    /// Set viewport to a specific page + scroll offset. Used by
+    /// bookmark recall, link follow, and back-stack pop. Skips the
+    /// "snap to anchor" pass `GotoPage` does so the offsets land
+    /// exactly where the caller asks.
+    JumpTo {
+        page_idx: usize,
+        x_off: i32,
+        y_off: i32,
+    },
+
     /// No-op. Convenient for Esc, repeated stateless keys, etc.
     None,
 }
@@ -126,6 +136,23 @@ impl Navigator {
 
             Action::SetRenderDpi(dpi) => viewport.render_dpi = dpi,
             Action::SetRenderQuality(q) => viewport.render_quality = q.clamp(0.1, 2.0),
+
+            Action::JumpTo {
+                page_idx,
+                x_off,
+                y_off,
+            } => {
+                let count = doc.page_count();
+                if count == 0 {
+                    return Ok(());
+                }
+                let clamped = page_idx.min(count - 1);
+                viewport.page_idx = clamped;
+                let size = doc.page_size(clamped)?;
+                viewport.x_off = x_off;
+                viewport.y_off = y_off;
+                viewport.clamp_offsets(size);
+            }
         }
         Ok(())
     }

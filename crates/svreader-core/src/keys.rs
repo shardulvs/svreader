@@ -57,6 +57,10 @@ pub enum Leader {
     G,
     /// `Ctrl-w` pressed — waiting for a window command key.
     CtrlW,
+    /// `m` pressed — waiting for a mark letter to set.
+    M,
+    /// `'` pressed — waiting for a mark letter to recall.
+    Apostrophe,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -86,6 +90,8 @@ impl KeyParserState {
             Leader::None => {}
             Leader::G => s.push('g'),
             Leader::CtrlW => s.push_str("^W"),
+            Leader::M => s.push('m'),
+            Leader::Apostrophe => s.push('\''),
         }
         s
     }
@@ -135,6 +141,16 @@ pub enum KeyOutcome {
     ToggleHelp,
     /// Request to quit.
     Quit,
+    /// `m{a-z}` — set a single-letter mark on the current viewport.
+    SetMark(char),
+    /// `'{a-z}` — jump to a previously-set mark.
+    JumpMark(char),
+    /// `<C-o>` — pop the back-stack.
+    JumpBack,
+    /// `<C-i>` (rare; usually unreachable from terminals).
+    JumpForward,
+    /// `t` — toggle the TOC overlay.
+    ToggleToc,
 }
 
 impl KeyOutcome {
@@ -168,6 +184,8 @@ impl KeyParser {
         match state.leader {
             Leader::G => return Self::feed_leader_g(state, key),
             Leader::CtrlW => return Self::feed_leader_ctrl_w(state, key),
+            Leader::M => return Self::feed_leader_m(state, key),
+            Leader::Apostrophe => return Self::feed_leader_apostrophe(state, key),
             Leader::None => {}
         }
 
@@ -265,6 +283,26 @@ impl KeyParser {
             Key::Char('R') => {
                 state.count = None;
                 KeyOutcome::action(Action::RotateCcw, 1)
+            }
+            Key::Char('t') => {
+                state.count = None;
+                KeyOutcome::ToggleToc
+            }
+            Key::Char('m') => {
+                state.leader = Leader::M;
+                KeyOutcome::Pending
+            }
+            Key::Char('\'') | Key::Char('`') => {
+                state.leader = Leader::Apostrophe;
+                KeyOutcome::Pending
+            }
+            Key::Ctrl('o') => {
+                state.count = None;
+                KeyOutcome::JumpBack
+            }
+            Key::Ctrl('i') => {
+                state.count = None;
+                KeyOutcome::JumpForward
             }
             Key::Ctrl('w') => {
                 // Opens the window-manager chord. Count prefix is
@@ -367,6 +405,36 @@ impl KeyParser {
                 state.count = None;
                 KeyOutcome::Pending
             }
+        }
+    }
+
+    /// After `m` has been pressed. Consumes one letter `[a-zA-Z]` and
+    /// emits `SetMark`. Anything else aborts the chord cleanly.
+    fn feed_leader_m(state: &mut KeyParserState, key: Key) -> KeyOutcome {
+        state.leader = Leader::None;
+        state.count = None;
+        let Key::Char(c) = key else {
+            return KeyOutcome::Pending;
+        };
+        if c.is_ascii_alphabetic() {
+            KeyOutcome::SetMark(c)
+        } else {
+            KeyOutcome::Pending
+        }
+    }
+
+    /// After `'` (or backtick) has been pressed. Same semantics as
+    /// `m`, but jumps instead of sets.
+    fn feed_leader_apostrophe(state: &mut KeyParserState, key: Key) -> KeyOutcome {
+        state.leader = Leader::None;
+        state.count = None;
+        let Key::Char(c) = key else {
+            return KeyOutcome::Pending;
+        };
+        if c.is_ascii_alphabetic() {
+            KeyOutcome::JumpMark(c)
+        } else {
+            KeyOutcome::Pending
         }
     }
 

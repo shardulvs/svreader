@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
 use mupdf::{Colorspace, Document as MuDocument, Matrix, TextPageFlags};
 
-use crate::document::{Document, Outline, PageMetrics, PageSize};
+use crate::document::{Document, Outline, PageLink, PageMetrics, PageSize, PdfRect};
 use crate::viewport::Rotation;
 
 /// mupdf-backed PDF. `mupdf` handles are not `Send`/`Sync`, so every
@@ -145,6 +145,43 @@ impl Document for PdfDocument {
             .to_text_page(TextPageFlags::empty())
             .context("failed to extract text page")?;
         Ok(tp.to_text().context("failed to stringify text page")?)
+    }
+
+    fn page_links(&self, page_idx: usize) -> Result<Vec<PageLink>> {
+        let page = self
+            .inner
+            .load_page(page_idx as i32)
+            .with_context(|| format!("failed to load page {page_idx}"))?;
+        let iter = page.links().context("failed to enumerate page links")?;
+        let mut out = Vec::new();
+        for link in iter {
+            // External (URI) links have dest=None — skip them.
+            let Some(dest) = link.dest else { continue };
+            let dest_page = dest.loc.page_number as usize;
+            let bounds = PdfRect {
+                x0: link.bounds.x0,
+                y0: link.bounds.y0,
+                x1: link.bounds.x1,
+                y1: link.bounds.y1,
+            };
+            let dest_point = match dest.kind {
+                mupdf::DestinationKind::XYZ { left, top, .. } => {
+                    Some((left.unwrap_or(0.0), top.unwrap_or(0.0)))
+                }
+                mupdf::DestinationKind::FitH { top }
+                | mupdf::DestinationKind::FitBH { top } => Some((0.0, top)),
+                mupdf::DestinationKind::FitV { left }
+                | mupdf::DestinationKind::FitBV { left } => Some((left, 0.0)),
+                mupdf::DestinationKind::FitR { left, top, .. } => Some((left, top)),
+                _ => None,
+            };
+            out.push(PageLink {
+                bounds,
+                dest_page,
+                dest_point,
+            });
+        }
+        Ok(out)
     }
 }
 

@@ -212,7 +212,16 @@ fn cmd_simulate(pdf: PathBuf, keys: String, screen: String, out_dir: PathBuf) ->
             KeyOutcome::Pending
             | KeyOutcome::OpenCommand
             | KeyOutcome::ToggleHelp
-            | KeyOutcome::Window(_) => {}
+            | KeyOutcome::Window(_)
+            | KeyOutcome::SetMark(_)
+            | KeyOutcome::JumpMark(_)
+            | KeyOutcome::JumpBack
+            | KeyOutcome::JumpForward
+            | KeyOutcome::ToggleToc => {
+                // CLI simulator: M2 actions are no-ops (no overlay,
+                // no jump list, no marks). The render loop owns
+                // those.
+            }
             KeyOutcome::Quit => break,
         }
     }

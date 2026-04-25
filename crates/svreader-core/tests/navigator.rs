@@ -244,6 +244,8 @@ fn command_registry_parses_all_commands() {
             "buffer" => "1",
             "tabmove" => "+1",
             "resize" | "vresize" => "+2",
+            "delmark" => "a",
+            "mouse" => "on",
             _ => "",
         };
         let line = if arg.is_empty() {
@@ -500,4 +502,116 @@ fn command_registry_parses_resize_and_tabmove() {
     );
     assert_eq!(r.parse("tabmove +1").unwrap(), ParsedCommand::TabMove(1));
     assert_eq!(r.parse("tabmove -1").unwrap(), ParsedCommand::TabMove(-1));
+}
+
+// ============================ M2 tests ============================
+
+#[test]
+fn key_parser_set_mark_letter() {
+    let mut st = KeyParserState::default();
+    let r = KeyParser::feed(&mut st, Key::Char('m'));
+    assert_eq!(r, KeyOutcome::Pending);
+    assert_eq!(st.leader, Leader::M);
+    let r = KeyParser::feed(&mut st, Key::Char('a'));
+    assert_eq!(r, KeyOutcome::SetMark('a'));
+    assert!(!st.active());
+}
+
+#[test]
+fn key_parser_set_mark_non_letter_aborts_cleanly() {
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('m'));
+    let r = KeyParser::feed(&mut st, Key::Char('1'));
+    assert_eq!(r, KeyOutcome::Pending);
+    assert!(!st.active());
+}
+
+#[test]
+fn key_parser_jump_mark_apostrophe_and_backtick() {
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('\''));
+    let r = KeyParser::feed(&mut st, Key::Char('Z'));
+    assert_eq!(r, KeyOutcome::JumpMark('Z'));
+    let mut st = KeyParserState::default();
+    KeyParser::feed(&mut st, Key::Char('`'));
+    let r = KeyParser::feed(&mut st, Key::Char('z'));
+    assert_eq!(r, KeyOutcome::JumpMark('z'));
+}
+
+#[test]
+fn key_parser_ctrl_o_jumps_back() {
+    let mut st = KeyParserState::default();
+    let r = KeyParser::feed(&mut st, Key::Ctrl('o'));
+    assert_eq!(r, KeyOutcome::JumpBack);
+}
+
+#[test]
+fn key_parser_t_toggles_toc() {
+    let mut st = KeyParserState::default();
+    let r = KeyParser::feed(&mut st, Key::Char('t'));
+    assert_eq!(r, KeyOutcome::ToggleToc);
+}
+
+#[test]
+fn navigator_jump_to_clamps_offsets() {
+    let doc = doc_uniform(3, 600.0, 800.0);
+    let mut vp = Viewport {
+        screen_w: 600,
+        screen_h: 400,
+        zoom: ZoomMode::FitWidth,
+        ..Default::default()
+    };
+    Navigator::apply(
+        &doc,
+        &mut vp,
+        Action::JumpTo {
+            page_idx: 1,
+            x_off: 9999,
+            y_off: 9999,
+        },
+    )
+    .unwrap();
+    assert_eq!(vp.page_idx, 1);
+    // y_off clamped into the valid scroll range; not the wild
+    // out-of-bounds value we asked for.
+    let (_, ymax) = vp.y_range(vp.composed_page_size(doc.pages[1]).1);
+    assert_eq!(vp.y_off, ymax);
+}
+
+#[test]
+fn navigator_jump_to_out_of_range_clamps_page() {
+    let doc = doc_uniform(3, 600.0, 800.0);
+    let mut vp = Viewport::default();
+    Navigator::apply(
+        &doc,
+        &mut vp,
+        Action::JumpTo {
+            page_idx: 99,
+            x_off: 0,
+            y_off: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(vp.page_idx, 2);
+}
+
+#[test]
+fn command_registry_parses_m2_commands() {
+    let r = CommandRegistry::default();
+    assert_eq!(r.parse("toc").unwrap(), ParsedCommand::ToggleToc);
+    assert_eq!(r.parse("marks").unwrap(), ParsedCommand::ToggleMarks);
+    assert_eq!(r.parse("bookmarks").unwrap(), ParsedCommand::ToggleMarks);
+    assert_eq!(r.parse("delmark q").unwrap(), ParsedCommand::DeleteMark('q'));
+    assert_eq!(r.parse("back").unwrap(), ParsedCommand::JumpBack);
+    assert_eq!(r.parse("forward").unwrap(), ParsedCommand::JumpForward);
+    assert_eq!(r.parse("mouse on").unwrap(), ParsedCommand::MouseSet(true));
+    assert_eq!(r.parse("mouse off").unwrap(), ParsedCommand::MouseSet(false));
+    assert_eq!(r.parse("mouse").unwrap(), ParsedCommand::MouseToggle);
+}
+
+#[test]
+fn command_delmark_rejects_non_letter() {
+    let r = CommandRegistry::default();
+    assert!(r.parse("delmark 1").is_err());
+    assert!(r.parse("delmark").is_err());
 }

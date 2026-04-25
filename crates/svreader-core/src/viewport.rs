@@ -213,4 +213,42 @@ impl Viewport {
         self.x_off = self.x_off.clamp(xmin, xmax);
         self.y_off = self.y_off.clamp(ymin, ymax);
     }
+
+    /// Convert a screen pixel inside this viewport (relative to the
+    /// window's top-left) to a point on the current page in PDF
+    /// user-space points (pre-rotation, pre-scale). Returns None if
+    /// the click landed in the padding area outside the page.
+    pub fn screen_to_pdf_point(
+        &self,
+        page_size: PageSize,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Option<(f32, f32)> {
+        let scale = self.display_scale(page_size);
+        if scale <= 0.0 {
+            return None;
+        }
+        let (pw, ph) = self.composed_page_size(page_size);
+        // Position on the composed (rotated) page in screen pixels.
+        let px = screen_x + self.x_off;
+        let py = screen_y + self.y_off;
+        if px < 0 || py < 0 || px >= pw as i32 || py >= ph as i32 {
+            return None;
+        }
+        let pxf = px as f32;
+        let pyf = py as f32;
+        let rotated = self.rotation.apply_to_size(page_size);
+        // Convert rotated-page screen pixels back to rotated-page PDF
+        // points (divide out display_scale).
+        let rx = pxf / scale;
+        let ry = pyf / scale;
+        // Then unrotate back to the page's native coordinate system.
+        let (ux, uy) = match self.rotation {
+            Rotation::R0 => (rx, ry),
+            Rotation::R90 => (ry, rotated.width - rx),
+            Rotation::R180 => (rotated.width - rx, rotated.height - ry),
+            Rotation::R270 => (rotated.height - ry, rx),
+        };
+        Some((ux, uy))
+    }
 }

@@ -14,7 +14,7 @@ use anyhow::Result;
 
 use crate::cache::RenderCache;
 use crate::docstate::DocState;
-use crate::document::PageInfo;
+use crate::document::{Document, PageInfo};
 use crate::pdf::PdfDocument;
 use crate::prefetch::Prefetcher;
 
@@ -99,6 +99,17 @@ impl Buffer {
     }
 }
 
+/// One step in the per-buffer jump history. Captures enough of the
+/// viewport to put the user back exactly where they were before the
+/// jump (page + scroll), so `<C-o>` after a TOC-jump returns them to
+/// the body text they were reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JumpEntry {
+    pub page_idx: usize,
+    pub x_off: i32,
+    pub y_off: i32,
+}
+
 /// A PDF the user has opened. One instance per distinct path; two
 /// windows can hold references to the same buffer for vim-style shared
 /// buffers via the workspace's reference-counted pool.
@@ -114,6 +125,15 @@ pub struct PdfBuffer {
     /// Per-buffer prefetcher: owns its own mupdf handle (not `Send`)
     /// and dies with the buffer.
     pub prefetcher: Prefetcher,
+    /// Vim-style jump list: `<C-o>` walks backward, `:forward` walks
+    /// forward. In-memory only — matches vim's default behaviour
+    /// where the jump list isn't persisted.
+    pub back_stack: Vec<JumpEntry>,
+    pub forward_stack: Vec<JumpEntry>,
+    /// Lazy cache of internal links per page. Filled on demand the
+    /// first time the page is hit-tested. Empty `Vec` means "no
+    /// links on this page" (still cached so we don't re-query).
+    pub link_cache: std::collections::HashMap<usize, Vec<crate::document::PageLink>>,
 }
 
 impl PdfBuffer {
@@ -134,7 +154,27 @@ impl PdfBuffer {
             state,
             page_info,
             prefetcher,
+            back_stack: Vec::new(),
+            forward_stack: Vec::new(),
+            link_cache: std::collections::HashMap::new(),
         })
+    }
+
+    /// Look up cached links for `page_idx`, querying mupdf and caching
+    /// the result on first access. Returns an empty slice on render
+    /// errors.
+    pub fn links_for(&mut self, page_idx: usize) -> &[crate::document::PageLink] {
+        if !self.link_cache.contains_key(&page_idx) {
+            let links = match self.pdf.page_links(page_idx) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("page_links({page_idx}): {e:#}");
+                    Vec::new()
+                }
+            };
+            self.link_cache.insert(page_idx, links);
+        }
+        self.link_cache.get(&page_idx).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Filename for display (falls back to "document").

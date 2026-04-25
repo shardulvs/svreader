@@ -71,6 +71,36 @@ pub struct Outline {
     pub children: Vec<Outline>,
 }
 
+/// A rectangle in PDF user-space (pre-rotation, pre-scale). Origin at
+/// page top-left, units in PDF points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfRect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl PdfRect {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+}
+
+/// An interactive internal link on a page. External (URI) links are
+/// filtered out at the trait boundary — svreader only follows within
+/// the document.
+#[derive(Debug, Clone)]
+pub struct PageLink {
+    pub bounds: PdfRect,
+    /// Destination page index (0-based).
+    pub dest_page: usize,
+    /// Optional sub-page anchor in PDF user-space points (top-left).
+    /// Some PDFs encode this; many don't, in which case we land at
+    /// page top.
+    pub dest_point: Option<(f32, f32)>,
+}
+
 /// A document that svreader can display. Kept tight and synchronous —
 /// implementations may not be `Send`/`Sync` (mupdf isn't), so callers
 /// hold one per thread.
@@ -96,5 +126,12 @@ pub trait Document: PageMetrics {
 
     fn page_text(&self, _page_idx: usize) -> Result<String> {
         Ok(String::new())
+    }
+
+    /// Internal links on a single page. External (URI) links are
+    /// excluded. Default impl returns an empty vec for backends that
+    /// don't yet expose link annotations.
+    fn page_links(&self, _page_idx: usize) -> Result<Vec<PageLink>> {
+        Ok(Vec::new())
     }
 }

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use svreader_core::keys::WindowOp;
 use svreader_core::{
-    Action, Buffer, BufferId, BufferIdSource, ExplorerBuffer, Navigator, PageMetrics,
-    ParsedCommand, PdfBuffer, RenderCache, SplitDirection, Viewport,
+    Action, Buffer, BufferId, BufferIdSource, ExplorerBuffer, JumpEntry, Navigator, PageLink,
+    PageMetrics, ParsedCommand, PdfBuffer, RenderCache, SplitDirection, Viewport,
 };
 
 use crate::ecache_fill::EncCacheFiller;
@@ -405,6 +405,15 @@ impl Workspace {
     // -------------------- nav dispatch --------------------
 
     pub fn apply_nav(&mut self, action: Action, count: usize) -> Result<()> {
+        // Vim-style jump list bookkeeping: long-distance moves (`gg`,
+        // `G`, `:goto N`) push the pre-jump viewport so `<C-o>` works.
+        // `JumpTo` is excluded because it's only emitted by code
+        // paths that manage the stack themselves (jump_to_page,
+        // jump_back, jump_forward, mouse click-to-follow).
+        if is_jump_action(&action) {
+            self.push_back_stack();
+        }
+
         let focused_id = self.current_tab().focused;
         let buffer_id;
         {
@@ -871,7 +880,14 @@ impl Workspace {
             | ParsedCommand::Prefetch(_)
             | ParsedCommand::Reset
             | ParsedCommand::Colors(_)
-            | ParsedCommand::CopyPage => {
+            | ParsedCommand::CopyPage
+            | ParsedCommand::ToggleToc
+            | ParsedCommand::ToggleMarks
+            | ParsedCommand::DeleteMark(_)
+            | ParsedCommand::JumpBack
+            | ParsedCommand::JumpForward
+            | ParsedCommand::MouseSet(_)
+            | ParsedCommand::MouseToggle => {
                 // These are handled by the render loop directly (they
                 // touch UI state outside the workspace).
                 Err(anyhow!("__workspace_passthrough__"))
@@ -1159,6 +1175,232 @@ impl Workspace {
         }
     }
 
+    // -------------------- M2: jump list / marks / mouse / links --------------------
+
+    /// Set the focused window's `WindowId` directly. Used by mouse
+    /// click-to-focus.
+    pub fn set_focus_window(&mut self, id: WindowId) {
+        self.set_focus(id);
+    }
+
+    /// Capture the focused window's current viewport as a JumpEntry on
+    /// its buffer's back-stack. Clears the forward-stack — vim's
+    /// `<C-o>` semantics: making a new jump invalidates the old
+    /// forward branch.
+    fn push_back_stack(&mut self) {
+        let win = self.focused_window();
+        let buf_id = win.buffer;
+        let entry = JumpEntry {
+            page_idx: win.viewport.page_idx,
+            x_off: win.viewport.x_off,
+            y_off: win.viewport.y_off,
+        };
+        if let Some(pdf) = self.pool.get_pdf_mut(buf_id) {
+            // Cap at 100 — matches vim's default jumplist size. Pop
+            // the oldest entry when over.
+            const CAP: usize = 100;
+            pdf.back_stack.push(entry);
+            if pdf.back_stack.len() > CAP {
+                pdf.back_stack.remove(0);
+            }
+            pdf.forward_stack.clear();
+        }
+    }
+
+    /// Jump to a target page+offset, pushing the current viewport
+    /// onto the back-stack first. Used by TOC, marks, and link-follow.
+    pub fn jump_to_page(&mut self, page: usize, x_off: i32, y_off: i32) -> Result<()> {
+        self.push_back_stack();
+        self.apply_nav(
+            Action::JumpTo {
+                page_idx: page,
+                x_off,
+                y_off,
+            },
+            1,
+        )
+    }
+
+    /// `<C-o>`: pop the back-stack and jump there, pushing the
+    /// current viewport onto the forward-stack. Returns Ok(false) if
+    /// the back-stack was empty.
+    pub fn jump_back(&mut self) -> Result<bool> {
+        let buf_id = self.focused_window().buffer;
+        let popped = match self.pool.get_pdf_mut(buf_id) {
+            Some(pdf) => pdf.back_stack.pop(),
+            None => return Ok(false),
+        };
+        let Some(entry) = popped else { return Ok(false) };
+        // Capture current state to forward-stack.
+        let cur_entry = {
+            let win = self.focused_window();
+            JumpEntry {
+                page_idx: win.viewport.page_idx,
+                x_off: win.viewport.x_off,
+                y_off: win.viewport.y_off,
+            }
+        };
+        if let Some(pdf) = self.pool.get_pdf_mut(buf_id) {
+            pdf.forward_stack.push(cur_entry);
+        }
+        self.apply_nav(
+            Action::JumpTo {
+                page_idx: entry.page_idx,
+                x_off: entry.x_off,
+                y_off: entry.y_off,
+            },
+            1,
+        )?;
+        Ok(true)
+    }
+
+    /// Counterpart to `jump_back`. `<C-i>` (rare in terminals) or
+    /// `:forward`.
+    pub fn jump_forward(&mut self) -> Result<bool> {
+        let buf_id = self.focused_window().buffer;
+        let popped = match self.pool.get_pdf_mut(buf_id) {
+            Some(pdf) => pdf.forward_stack.pop(),
+            None => return Ok(false),
+        };
+        let Some(entry) = popped else { return Ok(false) };
+        let cur_entry = {
+            let win = self.focused_window();
+            JumpEntry {
+                page_idx: win.viewport.page_idx,
+                x_off: win.viewport.x_off,
+                y_off: win.viewport.y_off,
+            }
+        };
+        if let Some(pdf) = self.pool.get_pdf_mut(buf_id) {
+            pdf.back_stack.push(cur_entry);
+        }
+        self.apply_nav(
+            Action::JumpTo {
+                page_idx: entry.page_idx,
+                x_off: entry.x_off,
+                y_off: entry.y_off,
+            },
+            1,
+        )?;
+        Ok(true)
+    }
+
+    /// Set a mark from the focused viewport's current position.
+    pub fn set_bookmark(&mut self, mark: char) -> Result<()> {
+        if !mark.is_ascii_alphabetic() {
+            return Err(anyhow!("mark must be a letter"));
+        }
+        let win = self.focused_window();
+        let buf_id = win.buffer;
+        let page = win.viewport.page_idx;
+        let x_off = win.viewport.x_off;
+        let y_off = win.viewport.y_off;
+        let Some(pdf) = self.pool.get_pdf_mut(buf_id) else {
+            return Err(anyhow!("not a PDF buffer"));
+        };
+        pdf.state.set_bookmark(mark, page, x_off, y_off);
+        Ok(())
+    }
+
+    /// `'{a-z}` — recall a mark. Returns Ok(false) if the mark wasn't
+    /// set. Records the pre-jump viewport to the back-stack.
+    pub fn jump_bookmark(&mut self, mark: char) -> Result<bool> {
+        let buf_id = self.focused_window().buffer;
+        let target = match self.pool.get_pdf(buf_id) {
+            Some(pdf) => pdf.state.find_bookmark(mark).copied(),
+            None => return Ok(false),
+        };
+        let Some(bm) = target else { return Ok(false) };
+        self.jump_to_page(bm.page, bm.x_off, bm.y_off)?;
+        Ok(true)
+    }
+
+    pub fn delete_bookmark(&mut self, mark: char) -> bool {
+        let buf_id = self.focused_window().buffer;
+        match self.pool.get_pdf_mut(buf_id) {
+            Some(pdf) => pdf.state.delete_bookmark(mark),
+            None => false,
+        }
+    }
+
+    /// Persist mouse-on/off in the focused buffer's DocState. The
+    /// terminal-side capture is toggled by the caller.
+    pub fn set_mouse_pref(&mut self, enabled: Option<bool>) {
+        let buf_id = self.focused_window().buffer;
+        if let Some(pdf) = self.pool.get_pdf_mut(buf_id) {
+            pdf.state.mouse_enabled = enabled;
+        }
+    }
+
+    /// Hit-test a click in window `id` at window-relative pixel
+    /// (x, y). On hit, follows the link (jump + back-stack push).
+    /// Returns Ok(()) whether or not a link was hit; callers don't
+    /// get to know which case happened (matches vim — link follow is
+    /// silent, miss is silent).
+    pub fn click_at(&mut self, id: WindowId, x: i32, y: i32) -> Result<()> {
+        let buf_id = {
+            let Some(win) = self.tabs[self.current_tab].tree.find(id) else {
+                return Ok(());
+            };
+            win.buffer
+        };
+        let (viewport, page_idx, page_size) = {
+            let win = self.tabs[self.current_tab]
+                .tree
+                .find(id)
+                .ok_or_else(|| anyhow!("focused window missing"))?;
+            let Some(pdf) = self.pool.get_pdf(buf_id) else {
+                return Ok(());
+            };
+            let page_idx = win.viewport.page_idx;
+            let page_size = pdf.pdf.page_size(page_idx)?;
+            (win.viewport.clone(), page_idx, page_size)
+        };
+        let Some((px, py)) = viewport.screen_to_pdf_point(page_size, x, y) else {
+            return Ok(());
+        };
+        let target = {
+            let Some(pdf_buf) = self.pool.get_pdf_mut(buf_id) else {
+                return Ok(());
+            };
+            let links = pdf_buf.links_for(page_idx);
+            link_hit(links, px, py)
+        };
+        let Some((dest_page, dest_point)) = target else {
+            return Ok(());
+        };
+        // Translate dest_point (PDF user-space) into a viewport
+        // (x_off, y_off) for the dest page. If the destination has no
+        // explicit point, land at top-left.
+        let (x_off, y_off) = match dest_point {
+            None => (0, 0),
+            Some((px, py)) => {
+                // Reuse the focused window's viewport zoom/rotation
+                // to compute the dest scroll offsets.
+                let dest_size = match self.pool.get_pdf(buf_id) {
+                    Some(pdf) => pdf.pdf.page_size(dest_page)?,
+                    None => return Ok(()),
+                };
+                let mut vp = viewport.clone();
+                vp.page_idx = dest_page;
+                let scale = vp.display_scale(dest_size);
+                let (rx, ry) = match vp.rotation {
+                    svreader_core::Rotation::R0 => (px, py),
+                    svreader_core::Rotation::R90 => (dest_size.height - py, px),
+                    svreader_core::Rotation::R180 => {
+                        (dest_size.width - px, dest_size.height - py)
+                    }
+                    svreader_core::Rotation::R270 => (py, dest_size.width - px),
+                };
+                let x_off = (rx * scale).round() as i32;
+                let y_off = (ry * scale).round() as i32;
+                (x_off, y_off)
+            }
+        };
+        self.jump_to_page(dest_page, x_off, y_off)?;
+        Ok(())
+    }
+
     /// Flush every open buffer's DocState to disk. Called at shutdown
     /// and on tab/buffer close. Explorer buffers have no state to save.
     pub fn persist_all(&mut self) {
@@ -1181,4 +1423,24 @@ impl Workspace {
             }
         }
     }
+}
+
+/// Is this navigation action a "jump motion" worth pushing onto the
+/// back-stack? Mirrors vim's jumplist policy — only long-distance
+/// moves count, not continuous scrolling.
+fn is_jump_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::GotoPage(_) | Action::FirstPage | Action::LastPage
+    )
+}
+
+/// Find the link whose bounds contain the PDF user-space point (x, y).
+/// Returns the destination page + optional dest point. `None` if no
+/// hit. Used by mouse click-to-follow.
+fn link_hit(links: &[PageLink], x: f32, y: f32) -> Option<(usize, Option<(f32, f32)>)> {
+    links
+        .iter()
+        .find(|l| l.bounds.contains(x, y))
+        .map(|l| (l.dest_page, l.dest_point))
 }

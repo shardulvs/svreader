@@ -17,7 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -25,8 +28,9 @@ use crossterm::{cursor, execute};
 use svreader_core::cache::CacheKey;
 use svreader_core::keys::{ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, PageDir};
 use svreader_core::{
-    Action, Buffer, ColorPalette, CommandRegistry, ExplorerBuffer, ExplorerKind, PageMetrics,
-    ParsedCommand, PrefetchRequest, RenderCache, Renderer, Rotation, Viewport, ZoomMode,
+    Action, Buffer, ColorPalette, CommandRegistry, Document, ExplorerBuffer, ExplorerKind, Outline,
+    PageMetrics, ParsedCommand, PrefetchRequest, RenderCache, Renderer, Rotation, Viewport,
+    ZoomMode,
 };
 
 use crate::capabilities::{probe_sixel, SIXEL_TERMINALS};
@@ -41,7 +45,7 @@ use crate::RunOptions;
 
 const STATUS_ROWS: u16 = 1;
 const PALETTE_MAX_ROWS: u16 = 6;
-const HELP_ROWS: u16 = 20;
+const HELP_ROWS: u16 = 26;
 
 #[derive(Debug, Clone)]
 enum Mode {
@@ -51,6 +55,35 @@ enum Mode {
         completion_idx: Option<usize>,
     },
     Help,
+    /// Outline / table-of-contents picker over the focused PDF.
+    Toc {
+        entries: Vec<TocEntry>,
+        selected: usize,
+        scroll: usize,
+        pending: KeyParserState,
+    },
+    /// Bookmark list (`:marks` / `:bookmarks`).
+    Marks {
+        entries: Vec<MarkEntry>,
+        selected: usize,
+        scroll: usize,
+        pending: KeyParserState,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct TocEntry {
+    depth: usize,
+    title: String,
+    page: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkEntry {
+    mark: char,
+    page: usize,
+    x_off: i32,
+    y_off: i32,
 }
 
 pub fn run(opts: RunOptions) -> Result<()> {
@@ -63,6 +96,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
 
     let res = run_inner(opts, pdf_path, &mut stdout);
 
+    let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = disable_raw_mode();
     res
@@ -86,6 +120,9 @@ struct AppState {
     chrome_dirty: bool,
     /// True until the next key/resize — triggers a full clear.
     full_repaint: bool,
+    /// Whether mouse capture is currently on. Mirrors what the
+    /// terminal has been told via Enable/DisableMouseCapture.
+    mouse_enabled: bool,
 }
 
 fn run_inner(
@@ -190,6 +227,12 @@ fn run_inner(
     };
     let registry = CommandRegistry::default();
 
+    let initial_mouse = {
+        let buf_id = ws.focused_window().buffer;
+        ws.buffer_pdf(buf_id)
+            .and_then(|b| b.state.mouse_enabled)
+            .unwrap_or(true)
+    };
     let mut app = AppState {
         key_state: KeyParserState::default(),
         mode: Mode::Normal,
@@ -198,7 +241,11 @@ fn run_inner(
         message_expires: None,
         chrome_dirty: true,
         full_repaint: true,
+        mouse_enabled: initial_mouse,
     };
+    if app.mouse_enabled {
+        let _ = execute!(stdout, EnableMouseCapture);
+    }
 
     while !ws.quit_requested {
         // Expire messages.
@@ -277,6 +324,24 @@ fn run_inner(
                 let top = bottom.saturating_sub(HELP_ROWS);
                 draw_help(stdout, top, bottom, geom.cols)?;
             }
+            Mode::Toc {
+                entries,
+                selected,
+                scroll,
+                ..
+            } => {
+                let body = body_rect(geom, if ws.tab_count() > 1 { 1 } else { 0 });
+                draw_toc_overlay(stdout, body, entries, *selected, *scroll)?;
+            }
+            Mode::Marks {
+                entries,
+                selected,
+                scroll,
+                ..
+            } => {
+                let body = body_rect(geom, if ws.tab_count() > 1 { 1 } else { 0 });
+                draw_marks_overlay(stdout, body, entries, *selected, *scroll)?;
+            }
         }
         stdout.flush()?;
 
@@ -352,6 +417,13 @@ fn run_inner(
                             app.full_repaint = true;
                         }
                     }
+                    Mode::Toc { .. } => handle_toc_key(&mut ws, &mut app, k)?,
+                    Mode::Marks { .. } => handle_marks_key(&mut ws, &mut app, k)?,
+                }
+            }
+            Event::Mouse(m) => {
+                if app.mouse_enabled && matches!(app.mode, Mode::Normal) {
+                    handle_mouse(&mut ws, &mut app, m, geom)?;
                 }
             }
             _ => {}
@@ -872,13 +944,17 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         "   + / -         zoom in / out",
         "   r / R         rotate CW / CCW",
         "   n             toggle night mode",
+        "   t             open table of contents",
+        "   m{a-z}        set bookmark   '{a-z}   jump to bookmark",
+        "   Ctrl-o        jump back (jump list)",
+        "   click link    follow internal PDF link (mouse)",
         "   Ctrl-w h/j/k/l   move focus",
         "   Ctrl-w s / v     split horizontal / vertical",
         "   Ctrl-w c / o     close / only",
         "   gt / gT       next / previous tab",
         "   Ctrl-^        alternate buffer",
         "   (in :Ex)      j/k select, Enter/l open, -/u/h/Backspace parent",
-        "   :             command palette  (:open, :edit, :split, :tabnew, :Ex, :Vex, :q, :qa)",
+        "   :             command palette  (:toc, :marks, :back, :mouse, ...)",
         "   ?             toggle this help   q   quit",
         "",
         " Press ? or Esc to close.",
@@ -984,6 +1060,13 @@ fn drain_pending_events(
                             app.full_repaint = true;
                         }
                     }
+                    Mode::Toc { .. } => handle_toc_key(ws, app, k)?,
+                    Mode::Marks { .. } => handle_marks_key(ws, app, k)?,
+                }
+            }
+            Event::Mouse(m) => {
+                if app.mouse_enabled && matches!(app.mode, Mode::Normal) {
+                    handle_mouse(ws, app, m, *geom)?;
                 }
             }
             _ => {}
@@ -1129,6 +1212,33 @@ fn handle_normal_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Res
                 set_message(app, format!("{e}"));
             }
         }
+        KeyOutcome::ToggleToc => {
+            if let Err(e) = enter_toc_mode(ws, app) {
+                set_message(app, format!("{e}"));
+            }
+        }
+        KeyOutcome::SetMark(c) => {
+            if let Err(e) = ws.set_bookmark(c) {
+                set_message(app, format!("mark: {e}"));
+            } else {
+                set_message(app, format!("mark '{c}' set"));
+            }
+        }
+        KeyOutcome::JumpMark(c) => match ws.jump_bookmark(c) {
+            Ok(true) => app.full_repaint = true,
+            Ok(false) => set_message(app, format!("mark '{c}' not set")),
+            Err(e) => set_message(app, format!("jump-mark: {e}")),
+        },
+        KeyOutcome::JumpBack => match ws.jump_back() {
+            Ok(true) => app.full_repaint = true,
+            Ok(false) => set_message(app, "jump list empty".into()),
+            Err(e) => set_message(app, format!("back: {e}")),
+        },
+        KeyOutcome::JumpForward => match ws.jump_forward() {
+            Ok(true) => app.full_repaint = true,
+            Ok(false) => set_message(app, "no forward jump".into()),
+            Err(e) => set_message(app, format!("forward: {e}")),
+        },
     }
     Ok(())
 }
@@ -1274,6 +1384,40 @@ fn execute_command(
                 Err(e) => set_message(app, format!("copy failed: {e}")),
             }
         }
+        ParsedCommand::ToggleToc => {
+            enter_toc_mode(ws, app)?;
+        }
+        ParsedCommand::ToggleMarks => {
+            enter_marks_mode(ws, app)?;
+        }
+        ParsedCommand::DeleteMark(c) => {
+            if ws.delete_bookmark(c) {
+                set_message(app, format!("mark '{c}' deleted"));
+            } else {
+                set_message(app, format!("no mark '{c}'"));
+            }
+        }
+        ParsedCommand::JumpBack => match ws.jump_back() {
+            Ok(true) => {}
+            Ok(false) => set_message(app, "jump list empty".into()),
+            Err(e) => set_message(app, format!("back: {e}")),
+        },
+        ParsedCommand::JumpForward => match ws.jump_forward() {
+            Ok(true) => {}
+            Ok(false) => set_message(app, "no forward jump".into()),
+            Err(e) => set_message(app, format!("forward: {e}")),
+        },
+        ParsedCommand::MouseSet(b) => {
+            set_mouse_capture(app, b);
+            ws.set_mouse_pref(Some(b));
+            set_message(app, format!("mouse {}", if b { "on" } else { "off" }));
+        }
+        ParsedCommand::MouseToggle => {
+            let new_val = !app.mouse_enabled;
+            set_mouse_capture(app, new_val);
+            ws.set_mouse_pref(Some(new_val));
+            set_message(app, format!("mouse {}", if new_val { "on" } else { "off" }));
+        }
         ParsedCommand::Colors(p) => {
             let color = match p {
                 ColorPalette::XTerm256 => ColorMode::XTerm256,
@@ -1296,7 +1440,14 @@ fn execute_command(
             ws.apply_command(other)?;
         }
     }
-    app.full_repaint = true;
+    // If the command put us into a fullscreen-ish overlay (TOC /
+    // marks), skip the full repaint — the overlay clears its own
+    // rect and a forced sixel re-emit underneath it just flashes.
+    // Help also overlays but only over the bottom strip, so a
+    // repaint there is harmless.
+    if !matches!(app.mode, Mode::Toc { .. } | Mode::Marks { .. }) {
+        app.full_repaint = true;
+    }
     Ok(())
 }
 
@@ -1581,6 +1732,448 @@ fn crossterm_to_key(k: KeyEvent) -> Option<Key> {
         _ => return None,
     };
     Some(key)
+}
+
+// ===================== M2: TOC / Marks / Mouse =====================
+
+fn enter_toc_mode(ws: &mut Workspace, app: &mut AppState) -> Result<()> {
+    let buf_id = ws.focused_window().buffer;
+    let Some(pdf_buf) = ws.buffer_pdf(buf_id) else {
+        return Err(anyhow::anyhow!("not a PDF buffer"));
+    };
+    let outline = pdf_buf.pdf.outline().unwrap_or_default();
+    let mut entries: Vec<TocEntry> = Vec::new();
+    flatten_outline(&outline, 0, &mut entries);
+    if entries.is_empty() {
+        return Err(anyhow::anyhow!("document has no outline"));
+    }
+    let cur_page = ws.focused_window().viewport.page_idx;
+    let selected = entries
+        .iter()
+        .rposition(|e| e.page <= cur_page)
+        .unwrap_or(0);
+    app.mode = Mode::Toc {
+        entries,
+        selected,
+        scroll: 0,
+        pending: KeyParserState::default(),
+    };
+    // Deliberately NOT setting `full_repaint = true`: the overlay's
+    // own row-wipe clears the sixels behind it, and forcing a full
+    // re-emit on every j/k causes a visible flash. Same pattern as
+    // Mode::Help — only the close path repaints.
+    Ok(())
+}
+
+fn enter_marks_mode(ws: &mut Workspace, app: &mut AppState) -> Result<()> {
+    let buf_id = ws.focused_window().buffer;
+    let Some(pdf_buf) = ws.buffer_pdf(buf_id) else {
+        return Err(anyhow::anyhow!("not a PDF buffer"));
+    };
+    let mut entries: Vec<MarkEntry> = pdf_buf
+        .state
+        .bookmarks
+        .iter()
+        .map(|b| MarkEntry {
+            mark: b.mark,
+            page: b.page,
+            x_off: b.x_off,
+            y_off: b.y_off,
+        })
+        .collect();
+    entries.sort_by_key(|e| e.mark);
+    if entries.is_empty() {
+        return Err(anyhow::anyhow!("no marks set (use m{{a-z}} to set one)"));
+    }
+    app.mode = Mode::Marks {
+        entries,
+        selected: 0,
+        scroll: 0,
+        pending: KeyParserState::default(),
+    };
+    // See `enter_toc_mode` — overlay clears its own rect; a forced
+    // full repaint here would just re-emit the sixels behind it.
+    Ok(())
+}
+
+fn flatten_outline(items: &[Outline], depth: usize, out: &mut Vec<TocEntry>) {
+    for item in items {
+        if let Some(p) = item.page {
+            out.push(TocEntry {
+                depth,
+                title: item.title.clone(),
+                page: p,
+            });
+        } else {
+            // Section header without a page link — still useful as a
+            // visual landmark, point it at page 0 (the Enter handler
+            // will just do nothing useful, but j/k still works past
+            // it).
+            out.push(TocEntry {
+                depth,
+                title: item.title.clone(),
+                page: 0,
+            });
+        }
+        flatten_outline(&item.children, depth + 1, out);
+    }
+}
+
+/// Shared move-by-N logic for TOC + Marks. Counts come from the
+/// per-mode `KeyParserState` so `5j` works in both lists.
+fn list_move(selected: &mut usize, total: usize, delta: isize) {
+    if total == 0 {
+        return;
+    }
+    let cur = *selected as isize;
+    let mut next = cur + delta;
+    if next < 0 {
+        next = 0;
+    }
+    if next >= total as isize {
+        next = total as isize - 1;
+    }
+    *selected = next as usize;
+}
+
+fn handle_toc_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Result<()> {
+    let Mode::Toc {
+        entries,
+        selected,
+        scroll: _,
+        pending,
+    } = &mut app.mode
+    else {
+        return Ok(());
+    };
+    if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t')) && !pending.active() {
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return Ok(());
+    }
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return Ok(());
+    }
+    if k.code == KeyCode::Enter {
+        let target = entries[*selected].page;
+        // Snapshot mode entries before we move out of the borrow.
+        let target_page = target;
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return ws.jump_to_page(target_page, 0, 0);
+    }
+    let total = entries.len();
+    let count = pending.count.unwrap_or(1).max(1) as isize;
+    match k.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            list_move(selected, total, count);
+            pending.clear();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            list_move(selected, total, -count);
+            pending.clear();
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            *selected = match pending.count.take() {
+                Some(n) => (n.saturating_sub(1)).min(total.saturating_sub(1)),
+                None => total.saturating_sub(1),
+            };
+            pending.clear();
+        }
+        KeyCode::Home => {
+            *selected = 0;
+            pending.clear();
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && (c != '0' || pending.count.is_some()) => {
+            let d = (c as u8 - b'0') as usize;
+            pending.count = Some(pending.count.unwrap_or(0).saturating_mul(10).saturating_add(d));
+        }
+        KeyCode::Char('g') => {
+            if pending.leader == svreader_core::keys::Leader::G {
+                *selected = pending.count.take().unwrap_or(1).saturating_sub(1).min(total.saturating_sub(1));
+                pending.clear();
+            } else {
+                pending.leader = svreader_core::keys::Leader::G;
+            }
+        }
+        _ => {
+            pending.clear();
+        }
+    }
+    // No full_repaint: only the overlay needs to redraw, and it
+    // does that unconditionally each loop iteration in TOC mode.
+    Ok(())
+}
+
+fn handle_marks_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Result<()> {
+    let Mode::Marks {
+        entries,
+        selected,
+        scroll: _,
+        pending,
+    } = &mut app.mode
+    else {
+        return Ok(());
+    };
+    if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) && !pending.active() {
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return Ok(());
+    }
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return Ok(());
+    }
+    if k.code == KeyCode::Enter {
+        let target = entries[*selected];
+        app.mode = Mode::Normal;
+        app.full_repaint = true;
+        return ws.jump_to_page(target.page, target.x_off, target.y_off);
+    }
+    if k.code == KeyCode::Char('d') {
+        // `d` deletes the selected mark, then refreshes the list.
+        let mark = entries[*selected].mark;
+        if ws.delete_bookmark(mark) {
+            entries.remove(*selected);
+            if *selected >= entries.len() && *selected > 0 {
+                *selected -= 1;
+            }
+            if entries.is_empty() {
+                app.mode = Mode::Normal;
+                // List now empty → falling back to Normal: need a
+                // full repaint to bring the page back.
+                app.full_repaint = true;
+            }
+        }
+        return Ok(());
+    }
+    let total = entries.len();
+    let count = pending.count.unwrap_or(1).max(1) as isize;
+    match k.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            list_move(selected, total, count);
+            pending.clear();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            list_move(selected, total, -count);
+            pending.clear();
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            *selected = total.saturating_sub(1);
+            pending.clear();
+        }
+        KeyCode::Home => {
+            *selected = 0;
+            pending.clear();
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && (c != '0' || pending.count.is_some()) => {
+            let d = (c as u8 - b'0') as usize;
+            pending.count = Some(pending.count.unwrap_or(0).saturating_mul(10).saturating_add(d));
+        }
+        KeyCode::Char('g') => {
+            if pending.leader == svreader_core::keys::Leader::G {
+                *selected = 0;
+                pending.clear();
+            } else {
+                pending.leader = svreader_core::keys::Leader::G;
+            }
+        }
+        _ => {
+            pending.clear();
+        }
+    }
+    // No full_repaint here either — the overlay redraw is enough.
+    Ok(())
+}
+
+fn draw_toc_overlay(
+    stdout: &mut impl Write,
+    body: CellRect,
+    entries: &[TocEntry],
+    selected: usize,
+    _scroll: usize,
+) -> Result<()> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let cols = body.cols as usize;
+    // Blank the body rect first.
+    for r in 0..body.rows {
+        write!(stdout, "\x1b[{};{}H\x1b[2K", body.row + r + 1, body.col + 1)?;
+    }
+    let header = format!(" TOC — {} entries — Enter open · j/k move · gg/G first/last · q close", entries.len());
+    let header_t: String = header.chars().take(cols).collect();
+    let pad = cols.saturating_sub(header_t.chars().count());
+    write!(
+        stdout,
+        "\x1b[{};{}H\x1b[48;5;236m\x1b[38;5;252m{}{}\x1b[0m",
+        body.row + 1,
+        body.col + 1,
+        header_t,
+        " ".repeat(pad)
+    )?;
+
+    let list_rows = body.rows.saturating_sub(1) as usize;
+    if list_rows == 0 {
+        return Ok(());
+    }
+    let scroll = if selected >= list_rows {
+        selected + 1 - list_rows
+    } else {
+        0
+    };
+    let visible = list_rows.min(entries.len().saturating_sub(scroll));
+    for i in 0..visible {
+        let abs = scroll + i;
+        let Some(entry) = entries.get(abs) else { break };
+        let row = body.row + 1 + i as u16;
+        let indent = "  ".repeat(entry.depth.min(8));
+        let line = format!(
+            "{}{}  · p{}",
+            indent,
+            entry.title,
+            entry.page.saturating_add(1)
+        );
+        let truncated: String = line.chars().take(cols).collect();
+        let pad = cols.saturating_sub(truncated.chars().count());
+        let selected_here = abs == selected;
+        write!(stdout, "\x1b[{};{}H", row + 1, body.col + 1)?;
+        if selected_here {
+            write!(stdout, "\x1b[7m")?;
+        }
+        write!(stdout, "{}{}", truncated, " ".repeat(pad))?;
+        if selected_here {
+            write!(stdout, "\x1b[0m")?;
+        }
+    }
+    Ok(())
+}
+
+fn draw_marks_overlay(
+    stdout: &mut impl Write,
+    body: CellRect,
+    entries: &[MarkEntry],
+    selected: usize,
+    _scroll: usize,
+) -> Result<()> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let cols = body.cols as usize;
+    for r in 0..body.rows {
+        write!(stdout, "\x1b[{};{}H\x1b[2K", body.row + r + 1, body.col + 1)?;
+    }
+    let header = format!(
+        " marks ({}) — Enter jump · d delete · j/k move · q close",
+        entries.len()
+    );
+    let header_t: String = header.chars().take(cols).collect();
+    let pad = cols.saturating_sub(header_t.chars().count());
+    write!(
+        stdout,
+        "\x1b[{};{}H\x1b[48;5;236m\x1b[38;5;252m{}{}\x1b[0m",
+        body.row + 1,
+        body.col + 1,
+        header_t,
+        " ".repeat(pad)
+    )?;
+    let list_rows = body.rows.saturating_sub(1) as usize;
+    if list_rows == 0 {
+        return Ok(());
+    }
+    let scroll = if selected >= list_rows {
+        selected + 1 - list_rows
+    } else {
+        0
+    };
+    let visible = list_rows.min(entries.len().saturating_sub(scroll));
+    for i in 0..visible {
+        let abs = scroll + i;
+        let Some(entry) = entries.get(abs) else { break };
+        let row = body.row + 1 + i as u16;
+        let line = format!(
+            "  '{}    page {}    ({},{})",
+            entry.mark,
+            entry.page.saturating_add(1),
+            entry.x_off,
+            entry.y_off
+        );
+        let truncated: String = line.chars().take(cols).collect();
+        let pad = cols.saturating_sub(truncated.chars().count());
+        let selected_here = abs == selected;
+        write!(stdout, "\x1b[{};{}H", row + 1, body.col + 1)?;
+        if selected_here {
+            write!(stdout, "\x1b[7m")?;
+        }
+        write!(stdout, "{}{}", truncated, " ".repeat(pad))?;
+        if selected_here {
+            write!(stdout, "\x1b[0m")?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_mouse(
+    ws: &mut Workspace,
+    app: &mut AppState,
+    m: MouseEvent,
+    geom: TermGeom,
+) -> Result<()> {
+    // Only act on left-click down. Up / drag / move / scroll are
+    // ignored; scroll could navigate later but isn't part of M2.
+    if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+    let tab_bar_rows: u16 = if ws.tab_count() > 1 { 1 } else { 0 };
+    let body = body_rect(geom, tab_bar_rows);
+    let layout = ws.layout(body);
+    // Find the window the click is in.
+    let Some((win_id, rect)) = layout.iter().find(|(_, r)| {
+        m.column >= r.col
+            && m.column < r.col.saturating_add(r.cols)
+            && m.row >= r.row
+            && m.row < r.row.saturating_add(r.rows)
+    }) else {
+        return Ok(());
+    };
+    let win_id = *win_id;
+    let rect = *rect;
+    // If the click is in a different window than the focused one,
+    // refocus first (vim's mouse-click behaviour). Repaints handled
+    // by the main loop.
+    if win_id != ws.current_tab().focused {
+        ws.set_focus_window(win_id);
+        app.full_repaint = true;
+        return Ok(());
+    }
+    // Convert cell to pixel within the window.
+    let local_col = m.column - rect.col;
+    let local_row = m.row - rect.row;
+    let px_x = local_col as i32 * geom.cell_px_w as i32 + (geom.cell_px_w as i32 / 2);
+    let px_y = local_row as i32 * geom.cell_px_h as i32 + (geom.cell_px_h as i32 / 2);
+    if let Err(e) = ws.click_at(win_id, px_x, px_y) {
+        set_message(app, format!("link: {e}"));
+    } else {
+        // A successful link follow triggers a full repaint.
+        app.full_repaint = true;
+    }
+    Ok(())
+}
+
+fn set_mouse_capture(app: &mut AppState, on: bool) {
+    if app.mouse_enabled == on {
+        return;
+    }
+    app.mouse_enabled = on;
+    let mut stdout = io::stdout();
+    if on {
+        let _ = execute!(stdout, EnableMouseCapture);
+    } else {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
 }
 
 /// Render the focused window's current page and push the PNG bytes to
