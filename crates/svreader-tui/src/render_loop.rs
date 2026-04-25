@@ -1005,6 +1005,7 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         " svreader — keys",
         "",
         "   j / k         next / prev screen (10% overlap)",
+        "   ↓ / ↑         fine scroll down/up (10% of viewport)",
         "   Ctrl-d/u      half-screen down/up",
         "   Ctrl-f/b      next/prev page (no overlap)",
         "   gg / G        first / last page",

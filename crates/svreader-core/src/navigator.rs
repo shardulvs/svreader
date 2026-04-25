@@ -15,6 +15,10 @@ pub enum Action {
     PrevPage,
     HalfScreenDown,
     HalfScreenUp,
+    /// Fine vertical scroll: 10% of viewport height. `Ctrl-j`/`Ctrl-k`.
+    /// Flips to next/prev page at the page boundary, like `j`/`k`.
+    FineScrollDown,
+    FineScrollUp,
     ScrollLeft,
     ScrollRight,
     PageTop,
@@ -85,6 +89,8 @@ impl Navigator {
             }
             Action::HalfScreenDown => half_screen(doc, viewport, 1)?,
             Action::HalfScreenUp => half_screen(doc, viewport, -1)?,
+            Action::FineScrollDown => fine_scroll(doc, viewport, 1)?,
+            Action::FineScrollUp => fine_scroll(doc, viewport, -1)?,
             Action::ScrollLeft => scroll_horiz(doc, viewport, -1)?,
             Action::ScrollRight => scroll_horiz(doc, viewport, 1)?,
 
@@ -250,6 +256,36 @@ fn half_screen<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport, dir: i
     } else {
         viewport.y_off = target.clamp(ymin, ymax);
     }
+    Ok(())
+}
+
+fn fine_scroll<M: PageMetrics + ?Sized>(doc: &M, viewport: &mut Viewport, dir: i32) -> Result<()> {
+    let (_, ph, size) = composed_or_zero(doc, viewport)?;
+    let (ymin, ymax) = viewport.y_range(ph);
+    if viewport.page_fits(size) {
+        // No scroll room — flip pages, mirroring next_screen/prev_screen.
+        if dir > 0 && viewport.page_idx + 1 < doc.page_count() {
+            goto_page(doc, viewport, viewport.page_idx + 1, Anchor::Start)?;
+        } else if dir < 0 && viewport.page_idx > 0 {
+            goto_page(doc, viewport, viewport.page_idx - 1, Anchor::End)?;
+        }
+        return Ok(());
+    }
+    if dir > 0 && viewport.y_off >= ymax {
+        if viewport.page_idx + 1 < doc.page_count() {
+            goto_page(doc, viewport, viewport.page_idx + 1, Anchor::Start)?;
+        }
+        return Ok(());
+    }
+    if dir < 0 && viewport.y_off <= ymin {
+        if viewport.page_idx > 0 {
+            goto_page(doc, viewport, viewport.page_idx - 1, Anchor::End)?;
+        }
+        return Ok(());
+    }
+    let step = ((viewport.screen_h as f32) * SCROLL_OVERLAP).round() as i32;
+    let step = step.max(1);
+    viewport.y_off = (viewport.y_off + dir * step).clamp(ymin, ymax);
     Ok(())
 }
 

@@ -234,13 +234,21 @@ impl KeyParser {
                 state.clear();
                 KeyOutcome::Quit
             }
-            Key::Char('j') | Key::Down => {
+            Key::Char('j') => {
                 let n = state.count.take().unwrap_or(1);
                 KeyOutcome::action(Action::NextScreen, n)
             }
-            Key::Char('k') | Key::Up => {
+            Key::Char('k') => {
                 let n = state.count.take().unwrap_or(1);
                 KeyOutcome::action(Action::PrevScreen, n)
+            }
+            Key::Down => {
+                let n = state.count.take().unwrap_or(1);
+                KeyOutcome::action(Action::FineScrollDown, n)
+            }
+            Key::Up => {
+                let n = state.count.take().unwrap_or(1);
+                KeyOutcome::action(Action::FineScrollUp, n)
             }
             Key::Char('h') | Key::Left => {
                 let n = state.count.take().unwrap_or(1);
