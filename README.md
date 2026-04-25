@@ -14,9 +14,9 @@ document, so your place in a book survives across runs.
 
 ## Features
 
-- Full vim navigation: `j k h l`, `<C-d>/<C-u>`, `<C-f>/<C-b>`,
-  `gg`/`G`/`[N]G`, `H M L`, count prefixes, `:` command palette with
-  completion, `?` help overlay.
+- Full vim navigation: `j k h l`, `↓`/`↑` (10% fine scroll),
+  `<C-d>/<C-u>`, `<C-f>/<C-b>`, `gg`/`G`/`[N]G`, `H M L`, count
+  prefixes, `:` command palette with completion, `?` help overlay.
 - Zoom modes: fit-width / fit-height / fit-page / custom; rotation
   0/90/180/270; night mode with RGB inversion.
 - Vim-style **tabs** (`:tabnew`, `gt`/`gT`, `Ctrl-PageUp/Down`) and
@@ -26,13 +26,26 @@ document, so your place in a book survives across runs.
 - **Netrw-style file explorer** (`:Ex`, `:Sex`, `:Vex`). Argless
   `svreader` lands in an explorer at `$PWD`; `svreader some/dir/`
   lands in an explorer there.
-- In-process **LRU page cache** with background prefetch. Runtime
-  knobs: `:cache on/off/toggle`, `:cache-size N`, `:prefetch N`.
+- **Outline / TOC** (`t` or `:toc`) — j/k/gg/G with counts, Enter
+  to jump.
+- **Bookmarks** (`m{a-z}` to set, `'{a-z}` to recall, `:marks`,
+  `:delmark`) — sub-page offset preserved, persisted into the
+  sidecar.
+- **Jump list** (`<C-o>` back, `:back` / `:forward`) — TOC jumps,
+  `gg`/`G`/`:goto`, mark recalls and link clicks all push.
+- **In-doc search** (`/`, `?`, `n`, `N`) with mupdf's text-page
+  search; matches are tinted on the rendered image, focused hit in
+  a stronger colour.
+- **Text extraction** (`:text`) hands the terminal off to `$EDITOR`
+  (or `vim`/`vi`/`nano`) with the document's full text, restores
+  the alt-screen on exit.
+- **Mouse click-to-follow** for internal PDF links — toggle with
+  `:mouse on|off|toggle`. Click in an unfocused window refocuses it.
 - **Quality / DPI levers** (`:quality N%`, `:dpi N|auto`) to trade
-  sharpness for encode+transmit speed. Status bar shows a per-stage
-  frame-time breakdown so it's obvious which lever to pull.
+  sharpness for encode+transmit speed.
 - **Per-document state persistence:** last page, zoom, rotation,
-  scroll offsets, night mode, render DPI/quality, cache enabled.
+  scroll offsets, night mode, render DPI/quality, bookmarks,
+  mouse-capture preference.
 
 ## Requirements
 
@@ -70,7 +83,10 @@ parent.
 
 Inside a PDF: `?` opens the keybinding cheatsheet; `:` opens the
 command palette (Tab/↑↓/`C-n`/`C-p` cycle completions, Enter pastes
-the highlight then Enter again to execute).
+the highlight then Enter again to execute). `t` opens the outline,
+`/` starts a search (`n`/`N` step), `m{letter}` sets a bookmark
+and `'{letter}` recalls it, `<C-o>` walks back through jumps, and
+clicking a link follows it.
 
 ## Project layout
 
