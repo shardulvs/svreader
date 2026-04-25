@@ -137,6 +137,18 @@ pub enum KeyOutcome {
     Window(WindowOp),
     /// Enter command-mode (open `:` palette).
     OpenCommand,
+    /// Open the search prompt. `forward = true` for `/`, `false` for
+    /// `?`.
+    OpenSearch { forward: bool },
+    /// Step through the active search results. `forward = true` for
+    /// `n`, `false` for `N`. The render loop falls back to whatever
+    /// `n`/`N` should mean when there's no active search (currently
+    /// `n` toggles night, `N` is a no-op).
+    SearchStep { forward: bool },
+    /// Esc with no active leader / count / mode — cancel transient UI
+    /// state. The render loop wires this to "clear search highlights"
+    /// (and any future ephemeral overlays).
+    Cancel,
     /// Toggle help overlay (`?`).
     ToggleHelp,
     /// Request to quit.
@@ -176,8 +188,9 @@ impl KeyParser {
         if key == Key::Esc {
             if state.active() {
                 state.clear();
+                return KeyOutcome::Pending;
             }
-            return KeyOutcome::Pending;
+            return KeyOutcome::Cancel;
         }
 
         // Dispatch while in a leader state.
@@ -207,7 +220,15 @@ impl KeyParser {
             }
             Key::Char('?') => {
                 state.clear();
-                KeyOutcome::ToggleHelp
+                KeyOutcome::OpenSearch { forward: false }
+            }
+            Key::Char('/') => {
+                state.clear();
+                KeyOutcome::OpenSearch { forward: true }
+            }
+            Key::Char('N') => {
+                state.clear();
+                KeyOutcome::SearchStep { forward: false }
             }
             Key::Char('q') => {
                 state.clear();
@@ -254,7 +275,7 @@ impl KeyParser {
             }
             Key::Char('n') => {
                 state.count = None;
-                KeyOutcome::action(Action::ToggleNight, 1)
+                KeyOutcome::SearchStep { forward: true }
             }
             Key::Char('+') | Key::Char('=') => {
                 state.count = None;

@@ -4,8 +4,8 @@ use anyhow::Result;
 use image::RgbaImage;
 
 use crate::cache::CachedPage;
-use crate::document::Document;
-use crate::viewport::Viewport;
+use crate::document::{Document, MatchRect, PageSize, PdfRect};
+use crate::viewport::{Rotation, Viewport};
 
 /// Per-page pixel padding color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,51 @@ pub struct RenderedFrame {
     pub composed: RgbaImage,
     pub render: Duration,
     pub compose: Duration,
+}
+
+/// Search highlights to overlay on the composed image. Rects are in
+/// PDF user-space (pre-rotation, pre-scale) — the composer handles the
+/// transform. The "current" rect (the one `n`/`N` is sitting on) gets
+/// a stronger tint so the user can spot it inside a sea of other hits.
+#[derive(Debug, Clone, Default)]
+pub struct Highlights {
+    pub page_size: Option<PageSize>,
+    pub rects: Vec<PdfRect>,
+    /// Index into `rects` that should be drawn with the "current" tint
+    /// rather than the muted bulk-match tint.
+    pub current: Option<usize>,
+}
+
+impl Highlights {
+    pub fn from_matches(
+        matches: &[MatchRect],
+        page_idx: usize,
+        page_size: PageSize,
+        current_global: Option<usize>,
+    ) -> Self {
+        // Filter the global match list down to this page only and
+        // remember which (filtered) entry was the global "current".
+        let mut rects = Vec::new();
+        let mut current_local: Option<usize> = None;
+        for (i, m) in matches.iter().enumerate() {
+            if m.page_idx != page_idx {
+                continue;
+            }
+            if Some(i) == current_global {
+                current_local = Some(rects.len());
+            }
+            rects.push(m.rect);
+        }
+        Self {
+            page_size: Some(page_size),
+            rects,
+            current: current_local,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
 }
 
 pub struct Renderer;
@@ -105,6 +150,19 @@ impl Renderer {
         page: &CachedPage,
         viewport: &Viewport,
     ) -> (RgbaImage, ComposeTiming) {
+        Self::compose_with_highlights(page, viewport, None)
+    }
+
+    /// Same as `compose`, but additionally tints any `Highlights`
+    /// rects on top of the composed image. Highlights live in PDF
+    /// user-space; we map them through the same rotation + display
+    /// scale that produced the rasterised page so the tint sits
+    /// exactly over the matched glyph quads.
+    pub fn compose_with_highlights(
+        page: &CachedPage,
+        viewport: &Viewport,
+        highlights: Option<&Highlights>,
+    ) -> (RgbaImage, ComposeTiming) {
         let start = std::time::Instant::now();
         let pad = PadColor::for_viewport(viewport).0;
         let sw = viewport.screen_w.max(1);
@@ -169,6 +227,12 @@ impl Renderer {
             }
         }
 
+        if let Some(hl) = highlights {
+            if let Some(page_size) = hl.page_size {
+                draw_highlights(&mut out, viewport, page_size, hl);
+            }
+        }
+
         (out, ComposeTiming { compose: start.elapsed() })
     }
 
@@ -183,6 +247,97 @@ impl Renderer {
             compose: ct.compose,
         })
     }
+}
+
+/// Tint colours used to paint match rectangles. Picked to be readable
+/// over both white page bodies and night-mode inverted ones — yellow
+/// for inactive hits, orange for the focused (`n`/`N` cursor) hit.
+const HIGHLIGHT_TINT: [u8; 3] = [0xFF, 0xE0, 0x40];
+const HIGHLIGHT_TINT_CURRENT: [u8; 3] = [0xFF, 0x80, 0x10];
+/// Strength of the alpha-blend over the underlying pixel. 0.0 = no
+/// tint, 1.0 = solid colour. 0.45 keeps the glyphs legible while still
+/// drawing the eye to a hit.
+const HIGHLIGHT_ALPHA: f32 = 0.45;
+const HIGHLIGHT_ALPHA_CURRENT: f32 = 0.55;
+
+fn draw_highlights(
+    out: &mut RgbaImage,
+    viewport: &Viewport,
+    page_size: PageSize,
+    hl: &Highlights,
+) {
+    if hl.rects.is_empty() {
+        return;
+    }
+    let scale = viewport.display_scale(page_size);
+    if scale <= 0.0 {
+        return;
+    }
+    let rotated = viewport.rotation.apply_to_size(page_size);
+    let (pw, ph) = viewport.composed_page_size(page_size);
+    let sw = out.width() as i32;
+    let sh = out.height() as i32;
+
+    for (i, r) in hl.rects.iter().enumerate() {
+        let is_current = Some(i) == hl.current;
+        let (tint, alpha) = if is_current {
+            (HIGHLIGHT_TINT_CURRENT, HIGHLIGHT_ALPHA_CURRENT)
+        } else {
+            (HIGHLIGHT_TINT, HIGHLIGHT_ALPHA)
+        };
+        // Map PDF user-space rect through rotation into rotated-page
+        // PDF points, then through display_scale into composed-image
+        // pixels. Same transform path as `screen_to_pdf_point`,
+        // inverted.
+        let pts = rotate_pdf_rect(*r, viewport.rotation, page_size, rotated);
+        let px0 = (pts.0 * scale).round() as i32 - viewport.x_off;
+        let py0 = (pts.1 * scale).round() as i32 - viewport.y_off;
+        let px1 = (pts.2 * scale).round() as i32 - viewport.x_off;
+        let py1 = (pts.3 * scale).round() as i32 - viewport.y_off;
+        let lo_x = px0.min(px1).max(0);
+        let lo_y = py0.min(py1).max(0);
+        let hi_x = px0.max(px1).min(sw);
+        let hi_y = py0.max(py1).min(sh);
+        if hi_x <= lo_x || hi_y <= lo_y {
+            continue;
+        }
+        let (_, _) = (pw, ph); // currently unused but kept for clarity
+        let stride = out.width() as usize * 4;
+        let buf = out.as_mut();
+        let inv_a = 1.0 - alpha;
+        for y in lo_y..hi_y {
+            let row_off = (y as usize) * stride + (lo_x as usize) * 4;
+            let row = &mut buf[row_off..row_off + ((hi_x - lo_x) as usize) * 4];
+            for px in row.chunks_exact_mut(4) {
+                px[0] = ((px[0] as f32) * inv_a + (tint[0] as f32) * alpha) as u8;
+                px[1] = ((px[1] as f32) * inv_a + (tint[1] as f32) * alpha) as u8;
+                px[2] = ((px[2] as f32) * inv_a + (tint[2] as f32) * alpha) as u8;
+                // alpha channel stays opaque
+            }
+        }
+    }
+}
+
+/// Apply `rotation` to a PDF user-space rect, returning the four
+/// corners as `(x0, y0, x1, y1)` in the rotated page's coordinate
+/// system (origin top-left of the rotated page, units PDF points).
+fn rotate_pdf_rect(
+    r: PdfRect,
+    rotation: Rotation,
+    page: PageSize,
+    rotated: PageSize,
+) -> (f32, f32, f32, f32) {
+    // Points in the unrotated page.
+    let (ax, ay) = (r.x0, r.y0);
+    let (bx, by) = (r.x1, r.y1);
+    let (cx0, cy0, cx1, cy1) = match rotation {
+        Rotation::R0 => (ax, ay, bx, by),
+        Rotation::R90 => (page.height - by, ax, page.height - ay, bx),
+        Rotation::R180 => (page.width - bx, page.height - by, page.width - ax, page.height - ay),
+        Rotation::R270 => (ay, page.width - bx, by, page.width - ax),
+    };
+    let _ = rotated;
+    (cx0, cy0, cx1, cy1)
 }
 
 /// Nearest-neighbour resize for RGBA. We don't need high-quality

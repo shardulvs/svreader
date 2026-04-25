@@ -28,9 +28,9 @@ use crossterm::{cursor, execute};
 use svreader_core::cache::CacheKey;
 use svreader_core::keys::{ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, PageDir};
 use svreader_core::{
-    Action, Buffer, ColorPalette, CommandRegistry, Document, ExplorerBuffer, ExplorerKind, Outline,
-    PageMetrics, ParsedCommand, PrefetchRequest, RenderCache, Renderer, Rotation, Viewport,
-    ZoomMode,
+    Action, Buffer, ColorPalette, CommandRegistry, Document, ExplorerBuffer, ExplorerKind,
+    Highlights, Outline, PageMetrics, ParsedCommand, PrefetchRequest, RenderCache, Renderer,
+    Rotation, Viewport, ZoomMode,
 };
 
 use crate::capabilities::{probe_sixel, SIXEL_TERMINALS};
@@ -53,6 +53,13 @@ enum Mode {
     Command {
         input: String,
         completion_idx: Option<usize>,
+    },
+    /// Live search prompt (`/` forward, `?` backward). Pressing Enter
+    /// runs the search across the focused PDF; Esc bails without
+    /// touching existing highlights.
+    Search {
+        input: String,
+        forward: bool,
     },
     Help,
     /// Outline / table-of-contents picker over the focused PDF.
@@ -319,6 +326,14 @@ fn run_inner(
                 write!(stdout, "\x1b[{};{}H", input_row + 1, col)?;
                 execute!(stdout, cursor::Show)?;
             }
+            Mode::Search { input, forward } => {
+                let bottom = geom.rows.saturating_sub(STATUS_ROWS);
+                let input_row = bottom.saturating_sub(1);
+                draw_search_prompt(stdout, input_row, geom.cols, input, *forward)?;
+                let col = (input.chars().count() as u16).saturating_add(2);
+                write!(stdout, "\x1b[{};{}H", input_row + 1, col)?;
+                execute!(stdout, cursor::Show)?;
+            }
             Mode::Help => {
                 let bottom = geom.rows.saturating_sub(STATUS_ROWS);
                 let top = bottom.saturating_sub(HELP_ROWS);
@@ -404,15 +419,15 @@ fn run_inner(
                 }
                 execute!(stdout, cursor::Hide)?;
                 match app.mode.clone() {
-                    Mode::Normal => handle_normal_key(&mut ws, &mut app, k)?,
+                    Mode::Normal => handle_normal_key(&mut ws, &mut app, k, &ecache)?,
                     Mode::Command { .. } => {
                         handle_command_key(&mut ws, &cache, &ecache, &registry, &mut app, k, stdout)?;
                     }
+                    Mode::Search { .. } => {
+                        handle_search_key(&mut ws, &ecache, &mut app, k)?;
+                    }
                     Mode::Help => {
-                        if matches!(k.code, KeyCode::Esc)
-                            || k.code == KeyCode::Char('?')
-                            || k.code == KeyCode::Char('q')
-                        {
+                        if matches!(k.code, KeyCode::Esc) || k.code == KeyCode::Char('q') {
                             app.mode = Mode::Normal;
                             app.full_repaint = true;
                         }
@@ -545,6 +560,23 @@ fn paint_window(
             w.color_mode,
         )
     };
+
+    // Build highlights for this page from the buffer's active search.
+    // Stays empty when no search is running — `compose_with_highlights`
+    // does nothing in that case.
+    let page_size_for_hl = buf.pdf.page_size(page_idx)?;
+    let highlights = if buf.search.is_active() {
+        Some(Highlights::from_matches(
+            &buf.search.matches,
+            page_idx,
+            page_size_for_hl,
+            buf.search.current,
+        ))
+    } else {
+        None
+    };
+    let has_highlights = highlights.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
+
     let rkey = CacheKey::new(buffer_id, page_idx, display_scale, raster_scale, rotation);
     let ekey =
         EncodedKey::from_viewport(buffer_id, &viewport, display_scale, raster_scale, color_mode);
@@ -556,7 +588,8 @@ fn paint_window(
     // process the input and repaint the new target directly. Keeps
     // us from spending 100+ ms encoding a frame the user no longer
     // cares about.
-    if ecache.get(&ekey).is_none() && has_pending_event() {
+    let ecache_hit_available = !has_highlights && ecache.get(&ekey).is_some();
+    if !ecache_hit_available && has_pending_event() {
         // Leave window state untouched (keeps dirty=true). The outer
         // loop will process the pending keys and re-enter paint.
         return Ok(());
@@ -569,7 +602,33 @@ fn paint_window(
     // RenderCache (single-flight'd → no duplicate mupdf renders),
     // then compose + encode. ECache has its own single-flight so
     // two paint calls for the identical viewport don't re-encode.
-    let (frame, render_dur, compose_dur, encode_dur) = {
+    //
+    // When this page has search highlights, the ECache key doesn't
+    // capture the highlight state — bypass the ECache entirely so a
+    // new compose+encode runs each time. (ECache is cleared on every
+    // search-state change, so stale entries can't leak in either.)
+    let (frame, render_dur, compose_dur, encode_dur) = if has_highlights {
+        let render_was_hot = cache.contains(&rkey);
+        let t_path = Instant::now();
+        let pdf = &buf.pdf;
+        let (page, _page_render_dur) = cache.get_or_render(rkey, || {
+            let (page, rt) = Renderer::render_page(pdf, &viewport)?;
+            Ok((page, rt.render))
+        })?;
+        let (composed, ct) = Renderer::compose_with_highlights(&page, &viewport, highlights.as_ref());
+        let (dcs, encode_dur) = encode_rgba_to_dcs(&composed, color_mode)?;
+        let frame = Arc::new(EncodedFrame {
+            dcs,
+            pixel_height: composed.height(),
+        });
+        let total = t_path.elapsed();
+        let render_d = if render_was_hot {
+            Duration::ZERO
+        } else {
+            total.saturating_sub(ct.compose + encode_dur)
+        };
+        (frame, render_d, ct.compose, encode_dur)
+    } else {
         // Pre-check: is the raster already cached? Used only to
         // attribute timing ("did this call cost a render?"); the
         // real guard against duplicate work is get_or_render.
@@ -835,6 +894,17 @@ fn draw_status(
                 " RCache:{}/{} ECache:{}/{}",
                 rcache_stats.0, rcache_stats.1, ecache_stats.0, ecache_stats.1
             ));
+            if let Some(Buffer::Pdf(pdf)) = buf {
+                if pdf.search.is_active() {
+                    let cur = pdf.search.current.map(|i| i + 1).unwrap_or(0);
+                    s.push_str(&format!(
+                        " /{} [{}/{}]",
+                        pdf.search.query,
+                        cur,
+                        pdf.search.matches.len()
+                    ));
+                }
+            }
             if let Some(t) = &focused.last_timing {
                 s.push(' ');
                 s.push_str(&t.short_label());
@@ -943,7 +1013,10 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         "   w / e / f     fit width / height / page",
         "   + / -         zoom in / out",
         "   r / R         rotate CW / CCW",
-        "   n             toggle night mode",
+        "   n             next match (or toggle night when no search)",
+        "   /  /  ?       search forward / backward",
+        "   N             previous match",
+        "   Esc           clear search highlights",
         "   t             open table of contents",
         "   m{a-z}        set bookmark   '{a-z}   jump to bookmark",
         "   Ctrl-o        jump back (jump list)",
@@ -954,10 +1027,10 @@ fn draw_help(stdout: &mut impl Write, top: u16, bottom: u16, cols: u16) -> Resul
         "   gt / gT       next / previous tab",
         "   Ctrl-^        alternate buffer",
         "   (in :Ex)      j/k select, Enter/l open, -/u/h/Backspace parent",
-        "   :             command palette  (:toc, :marks, :back, :mouse, ...)",
-        "   ?             toggle this help   q   quit",
+        "   :             command palette  (:toc, :text, :marks, :mouse, ...)",
+        "   :help         show this help   q   quit",
         "",
-        " Press ? or Esc to close.",
+        " Press q or Esc to close.",
     ];
     for (i, r) in (top..bottom).enumerate() {
         write!(stdout, "\x1b[{};1H\x1b[2K", r + 1)?;
@@ -1047,15 +1120,15 @@ fn drain_pending_events(
                     continue;
                 }
                 match app.mode.clone() {
-                    Mode::Normal => handle_normal_key(ws, app, k)?,
+                    Mode::Normal => handle_normal_key(ws, app, k, ecache)?,
                     Mode::Command { .. } => {
                         handle_command_key(ws, cache, ecache, registry, app, k, stdout)?;
                     }
+                    Mode::Search { .. } => {
+                        handle_search_key(ws, ecache, app, k)?;
+                    }
                     Mode::Help => {
-                        if matches!(k.code, KeyCode::Esc)
-                            || k.code == KeyCode::Char('?')
-                            || k.code == KeyCode::Char('q')
-                        {
+                        if matches!(k.code, KeyCode::Esc) || k.code == KeyCode::Char('q') {
                             app.mode = Mode::Normal;
                             app.full_repaint = true;
                         }
@@ -1119,7 +1192,12 @@ fn fire_prefetches(ws: &mut Workspace) {
     }
 }
 
-fn handle_normal_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Result<()> {
+fn handle_normal_key(
+    ws: &mut Workspace,
+    app: &mut AppState,
+    k: KeyEvent,
+    ecache: &Arc<ComposedEncodedCache>,
+) -> Result<()> {
     if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
         ws.quit_requested = true;
         return Ok(());
@@ -1196,6 +1274,39 @@ fn handle_normal_key(ws: &mut Workspace, app: &mut AppState, k: KeyEvent) -> Res
                 input: String::new(),
                 completion_idx: None,
             };
+        }
+        KeyOutcome::OpenSearch { forward } => {
+            app.mode = Mode::Search {
+                input: String::new(),
+                forward,
+            };
+        }
+        KeyOutcome::SearchStep { forward } => {
+            // If a search is active, n/N step through hits; otherwise
+            // fall back to the legacy meaning (n = night toggle, N = no-op).
+            let buf_id = ws.focused_window().buffer;
+            let has_active_search = ws
+                .buffer_pdf(buf_id)
+                .map(|b| b.search.is_active())
+                .unwrap_or(false);
+            if has_active_search {
+                step_search(ws, app, ecache, forward)?;
+            } else if forward {
+                ws.apply_nav(Action::ToggleNight, 1)?;
+            }
+        }
+        KeyOutcome::Cancel => {
+            // Esc with no pending state: drop active search highlights.
+            let buf_id = ws.focused_window().buffer;
+            let cleared = ws
+                .buffer_pdf_mut(buf_id)
+                .map(|b| b.clear_search())
+                .unwrap_or(false);
+            if cleared {
+                ecache.clear();
+                ws.focused_window_mut().dirty = true;
+                set_message(app, "search cleared".into());
+            }
         }
         KeyOutcome::ToggleHelp => {
             app.mode = Mode::Help;
@@ -1384,6 +1495,16 @@ fn execute_command(
                 Err(e) => set_message(app, format!("copy failed: {e}")),
             }
         }
+        ParsedCommand::OpenTextEditor => {
+            match open_document_text_in_editor(ws) {
+                Ok(()) => {
+                    // Editor took over the terminal; everything's
+                    // potentially trashed — request a full repaint.
+                    app.full_repaint = true;
+                }
+                Err(e) => set_message(app, format!(":text: {e}")),
+            }
+        }
         ParsedCommand::ToggleToc => {
             enter_toc_mode(ws, app)?;
         }
@@ -1455,6 +1576,188 @@ fn set_message(app: &mut AppState, msg: String) {
     app.message = Some(msg);
     app.message_expires = Some(Instant::now() + Duration::from_secs(2));
     app.chrome_dirty = true;
+}
+
+/// Run a fresh search for `query` against the focused PDF buffer and
+/// jump the focused window to the initial match (if any). Clears the
+/// encoded-frame cache so the next paint composes the new highlights.
+fn run_search(
+    ws: &mut Workspace,
+    app: &mut AppState,
+    ecache: &Arc<ComposedEncodedCache>,
+    query: &str,
+    forward: bool,
+) -> Result<()> {
+    let buf_id = ws.focused_window().buffer;
+    let from_page = ws.focused_window().viewport.page_idx;
+    let (matches_count, target) = {
+        let Some(buf) = ws.buffer_pdf_mut(buf_id) else {
+            return Ok(());
+        };
+        buf.run_search(query, from_page, forward);
+        let target = buf.search.current.and_then(|i| buf.search.matches.get(i).copied());
+        (buf.search.matches.len(), target)
+    };
+    ecache.clear();
+    if let Some(m) = target {
+        let (x_off, y_off) = match_to_offsets(ws, buf_id, &m)?;
+        ws.jump_to_page(m.page_idx, x_off, y_off)?;
+    } else {
+        ws.focused_window_mut().dirty = true;
+    }
+    if matches_count == 0 {
+        set_message(app, format!("no match for {:?}", query));
+    } else {
+        let cur = ws
+            .buffer_pdf(buf_id)
+            .and_then(|b| b.search.current)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        set_message(
+            app,
+            format!("/{}  [{}/{}]", query, cur, matches_count),
+        );
+    }
+    Ok(())
+}
+
+/// `n` / `N` after a successful search. Steps to the next/previous
+/// match and jumps the focused window there.
+fn step_search(
+    ws: &mut Workspace,
+    app: &mut AppState,
+    ecache: &Arc<ComposedEncodedCache>,
+    forward: bool,
+) -> Result<()> {
+    let buf_id = ws.focused_window().buffer;
+    let (target, total, current) = {
+        let Some(buf) = ws.buffer_pdf_mut(buf_id) else {
+            return Ok(());
+        };
+        let target = buf.step_search(forward);
+        (target, buf.search.matches.len(), buf.search.current)
+    };
+    ecache.clear();
+    let Some(m) = target else {
+        set_message(app, "no matches".into());
+        return Ok(());
+    };
+    let (x_off, y_off) = match_to_offsets(ws, buf_id, &m)?;
+    ws.jump_to_page(m.page_idx, x_off, y_off)?;
+    let cur = current.map(|i| i + 1).unwrap_or(0);
+    set_message(app, format!("[{}/{}]", cur, total));
+    Ok(())
+}
+
+/// Compute viewport `(x_off, y_off)` that scrolls the focused window
+/// so the given match sits roughly centred. Reuses the focused
+/// window's current zoom/rotation. Returns `(0, 0)` for the trivial
+/// "fits on screen" case so we don't fight `clamp_offsets` for tiny
+/// pages.
+fn match_to_offsets(
+    ws: &Workspace,
+    buf_id: svreader_core::BufferId,
+    m: &svreader_core::MatchRect,
+) -> Result<(i32, i32)> {
+    let Some(buf) = ws.buffer_pdf(buf_id) else {
+        return Ok((0, 0));
+    };
+    let win = ws.focused_window();
+    let page_size = buf.pdf.page_size(m.page_idx)?;
+    let scale = win.viewport.display_scale(page_size);
+    if scale <= 0.0 {
+        return Ok((0, 0));
+    }
+    // Map the rect into rotated-page PDF points.
+    let rotated = win.viewport.rotation.apply_to_size(page_size);
+    use svreader_core::Rotation;
+    let (rx0, ry0) = match win.viewport.rotation {
+        Rotation::R0 => (m.rect.x0, m.rect.y0),
+        Rotation::R90 => (page_size.height - m.rect.y1, m.rect.x0),
+        Rotation::R180 => (page_size.width - m.rect.x1, page_size.height - m.rect.y1),
+        Rotation::R270 => (m.rect.y0, page_size.width - m.rect.x1),
+    };
+    let cx = ((rx0) * scale).round() as i32;
+    let cy = ((ry0) * scale).round() as i32;
+    let sw = win.viewport.screen_w as i32;
+    let sh = win.viewport.screen_h as i32;
+    // Try to centre the match on screen.
+    let target_x = cx - sw / 3;
+    let target_y = cy - sh / 3;
+    // Clamp offsets into valid scroll range for the rotated page.
+    let pw = (rotated.width * scale).round().max(1.0) as u32;
+    let ph = (rotated.height * scale).round().max(1.0) as u32;
+    let (xmin, xmax) = win.viewport.x_range(pw);
+    let (ymin, ymax) = win.viewport.y_range(ph);
+    let x_off = target_x.clamp(xmin, xmax);
+    let y_off = target_y.clamp(ymin, ymax);
+    Ok((x_off, y_off))
+}
+
+/// Handle a key while the search prompt is open (after `/` or `?`).
+fn handle_search_key(
+    ws: &mut Workspace,
+    ecache: &Arc<ComposedEncodedCache>,
+    app: &mut AppState,
+    k: KeyEvent,
+) -> Result<()> {
+    let Mode::Search { input, forward } = &mut app.mode else {
+        return Ok(());
+    };
+    match k.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            app.full_repaint = true;
+        }
+        KeyCode::Enter => {
+            let query = std::mem::take(input);
+            let forward = *forward;
+            app.mode = Mode::Normal;
+            app.full_repaint = true;
+            if !query.is_empty() {
+                if let Err(e) = run_search(ws, app, ecache, &query, forward) {
+                    set_message(app, format!("search: {e}"));
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char(c) => {
+            if k.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                app.mode = Mode::Normal;
+                app.full_repaint = true;
+            } else {
+                input.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Draw the `/<query>` or `?<query>` prompt at `row`. Lives on the
+/// row right above the global status bar — same slot the `:` palette
+/// uses, but with a single line and no completion column.
+fn draw_search_prompt(
+    stdout: &mut impl Write,
+    row: u16,
+    cols: u16,
+    input: &str,
+    forward: bool,
+) -> Result<()> {
+    let prefix = if forward { '/' } else { '?' };
+    let line = format!("{}{}", prefix, input);
+    let truncated: String = line.chars().take(cols as usize).collect();
+    let pad = (cols as usize).saturating_sub(truncated.chars().count());
+    write!(
+        stdout,
+        "\x1b[{};1H\x1b[2K{}{}",
+        row + 1,
+        truncated,
+        " ".repeat(pad)
+    )?;
+    Ok(())
 }
 
 /// Move the palette's selection highlight forward (or backward, if
@@ -2174,6 +2477,99 @@ fn set_mouse_capture(app: &mut AppState, on: bool) {
     } else {
         let _ = execute!(stdout, DisableMouseCapture);
     }
+}
+
+/// Extract every page's text from the focused PDF buffer, write it
+/// to a temp file, suspend our raw-mode terminal, and hand control
+/// over to `$EDITOR` (defaulting to `vi`/`vim`/`nano` in that order).
+/// Restores our screen on return.
+fn open_document_text_in_editor(ws: &Workspace) -> Result<()> {
+    use anyhow::anyhow;
+    use std::process::Command as StdCommand;
+
+    let buf_id = ws.focused_window().buffer;
+    let Some(buf) = ws.buffer_pdf(buf_id) else {
+        return Err(anyhow!("not a PDF buffer"));
+    };
+    let n = buf.pdf.page_count();
+    let mut text = String::new();
+    for page_idx in 0..n {
+        if page_idx > 0 {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("--- Page {} ---\n\n", page_idx + 1));
+        match buf.pdf.page_text(page_idx) {
+            Ok(t) => text.push_str(&t),
+            Err(e) => text.push_str(&format!("[failed to extract page {}: {}]\n", page_idx + 1, e)),
+        }
+    }
+
+    // Write to a temp file alongside `/tmp` so the editor opens a
+    // real path. Filename includes the document stem so `:f` /
+    // `Ctrl-G` shows something recognisable.
+    let stem = buf
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".into());
+    let pid = std::process::id();
+    let tmp_path = std::env::temp_dir().join(format!("svreader-{stem}-{pid}.txt"));
+    std::fs::write(&tmp_path, &text)
+        .with_context(|| format!("writing {:?}", tmp_path))?;
+
+    // Pick an editor.
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| {
+            for cand in ["vim", "vi", "nano"] {
+                if which(cand).is_some() {
+                    return cand.to_string();
+                }
+            }
+            "vi".to_string()
+        });
+
+    // Hand the terminal to the editor: leave alt-screen, drop raw
+    // mode, hide our cursor management, restore mouse-off so the
+    // editor sees normal input.
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
+    let _ = disable_raw_mode();
+
+    // Run editor — let it inherit our std{in,out,err} fully.
+    let status_res = StdCommand::new(&editor).arg(&tmp_path).status();
+
+    // Reclaim the terminal.
+    let _ = enable_raw_mode();
+    let mut stdout2 = io::stdout();
+    let _ = execute!(stdout2, EnterAlternateScreen, cursor::Hide);
+    // Mouse capture is re-enabled by the outer event-loop's full
+    // repaint pass via set_mouse_capture's invariants — the
+    // reader's `app.mouse_enabled` flag still says what we want.
+    // Force a clear so any leftover paint from the editor doesn't
+    // mix with our sixel image.
+    let _ = write!(stdout2, "\x1b[2J");
+
+    match status_res {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(anyhow!("editor exited with {}", s)),
+        Err(e) => Err(anyhow!("failed to run {editor:?}: {e}")),
+    }
+}
+
+/// Like `which(1)` but minimal: walks `$PATH` and returns the first
+/// match. Used as a fallback when neither `$EDITOR` nor `$VISUAL` is
+/// set so `:text` still does something sensible on a fresh shell.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// Render the focused window's current page and push the PNG bytes to

@@ -887,7 +887,8 @@ impl Workspace {
             | ParsedCommand::JumpBack
             | ParsedCommand::JumpForward
             | ParsedCommand::MouseSet(_)
-            | ParsedCommand::MouseToggle => {
+            | ParsedCommand::MouseToggle
+            | ParsedCommand::OpenTextEditor => {
                 // These are handled by the render loop directly (they
                 // touch UI state outside the workspace).
                 Err(anyhow!("__workspace_passthrough__"))

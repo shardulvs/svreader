@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
 use mupdf::{Colorspace, Document as MuDocument, Matrix, TextPageFlags};
 
-use crate::document::{Document, Outline, PageLink, PageMetrics, PageSize, PdfRect};
+use crate::document::{Document, MatchRect, Outline, PageLink, PageMetrics, PageSize, PdfRect};
 use crate::viewport::Rotation;
 
 /// mupdf-backed PDF. `mupdf` handles are not `Send`/`Sync`, so every
@@ -145,6 +145,38 @@ impl Document for PdfDocument {
             .to_text_page(TextPageFlags::empty())
             .context("failed to extract text page")?;
         Ok(tp.to_text().context("failed to stringify text page")?)
+    }
+
+    fn page_search(&self, page_idx: usize, needle: &str) -> Result<Vec<MatchRect>> {
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let page = self
+            .inner
+            .load_page(page_idx as i32)
+            .with_context(|| format!("failed to load page {page_idx}"))?;
+        let tp = page
+            .to_text_page(TextPageFlags::empty())
+            .context("failed to extract text page")?;
+        let quads = tp
+            .search(needle)
+            .context("text-page search failed")?;
+        Ok(quads
+            .into_iter()
+            .map(|q| {
+                // mupdf returns oriented quads. For axis-aligned text
+                // (the common case) ul/ur/ll/lr line up; we collapse
+                // to a bounding rect.
+                let x0 = q.ul.x.min(q.ur.x).min(q.ll.x).min(q.lr.x);
+                let y0 = q.ul.y.min(q.ur.y).min(q.ll.y).min(q.lr.y);
+                let x1 = q.ul.x.max(q.ur.x).max(q.ll.x).max(q.lr.x);
+                let y1 = q.ul.y.max(q.ur.y).max(q.ll.y).max(q.lr.y);
+                MatchRect {
+                    page_idx,
+                    rect: PdfRect { x0, y0, x1, y1 },
+                }
+            })
+            .collect())
     }
 
     fn page_links(&self, page_idx: usize) -> Result<Vec<PageLink>> {

@@ -17,19 +17,19 @@ pub mod viewport;
 
 pub use buffer::{
     Buffer, BufferId, BufferIdSource, ExplorerBuffer, ExplorerEntry, ExplorerKind, JumpEntry,
-    PdfBuffer, EXPLORER_SUPPORTED_EXTS,
+    PdfBuffer, SearchState, EXPLORER_SUPPORTED_EXTS,
 };
 pub use cache::{CacheKey, CachedPage, RenderCache};
 pub use commands::{
     ColorPalette, Command, CommandArg, CommandRegistry, ParsedCommand, SplitDirection,
 };
 pub use docstate::{Bookmark, DocState};
-pub use document::{Document, Outline, PageInfo, PageLink, PageMetrics, PageSize, PdfRect};
+pub use document::{Document, MatchRect, Outline, PageInfo, PageLink, PageMetrics, PageSize, PdfRect};
 pub use keys::{
     ArrowDir, Key, KeyOutcome, KeyParser, KeyParserState, Leader, PageDir, WindowOp,
 };
 pub use navigator::{Action, Navigator};
 pub use pdf::PdfDocument;
 pub use prefetch::{PrefetchRequest, Prefetcher};
-pub use renderer::{ComposeTiming, RenderTiming, RenderedFrame, Renderer};
+pub use renderer::{ComposeTiming, Highlights, RenderTiming, RenderedFrame, Renderer};
 pub use viewport::{Rotation, Viewport, ZoomMode};

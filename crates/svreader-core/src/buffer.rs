@@ -14,7 +14,7 @@ use anyhow::Result;
 
 use crate::cache::RenderCache;
 use crate::docstate::DocState;
-use crate::document::{Document, PageInfo};
+use crate::document::{Document, MatchRect, PageInfo, PageMetrics};
 use crate::pdf::PdfDocument;
 use crate::prefetch::Prefetcher;
 
@@ -110,6 +110,43 @@ pub struct JumpEntry {
     pub y_off: i32,
 }
 
+/// In-memory search state for a buffer. Owns the active query, every
+/// hit across the document, and which hit `n` / `N` should land on
+/// next. Cleared by Esc and by re-entering search mode.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// Current query. Empty when no search is active.
+    pub query: String,
+    /// All hits across every page, sorted by `(page_idx, top, left)`.
+    pub matches: Vec<MatchRect>,
+    /// Index into `matches` for the currently-focused hit. None when
+    /// the result list is empty or no match has been visited yet.
+    pub current: Option<usize>,
+    /// Direction the user last searched in. Drives `n` / `N`.
+    pub forward: bool,
+    /// Bumped on every state change (new query, cleared, current
+    /// moved). The TUI compares this against the version it last
+    /// composed for to decide whether the encoded-frame cache needs a
+    /// flush before painting the highlights.
+    pub version: u64,
+}
+
+impl SearchState {
+    pub fn is_active(&self) -> bool {
+        !self.query.is_empty() && !self.matches.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        if self.query.is_empty() && self.matches.is_empty() && self.current.is_none() {
+            return;
+        }
+        self.query.clear();
+        self.matches.clear();
+        self.current = None;
+        self.version = self.version.wrapping_add(1);
+    }
+}
+
 /// A PDF the user has opened. One instance per distinct path; two
 /// windows can hold references to the same buffer for vim-style shared
 /// buffers via the workspace's reference-counted pool.
@@ -134,6 +171,8 @@ pub struct PdfBuffer {
     /// first time the page is hit-tested. Empty `Vec` means "no
     /// links on this page" (still cached so we don't re-query).
     pub link_cache: std::collections::HashMap<usize, Vec<crate::document::PageLink>>,
+    /// Active search state. Empty until the user runs `/`.
+    pub search: SearchState,
 }
 
 impl PdfBuffer {
@@ -157,7 +196,79 @@ impl PdfBuffer {
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             link_cache: std::collections::HashMap::new(),
+            search: SearchState::default(),
         })
+    }
+
+    /// Run `query` against every page; replace `self.search` with the
+    /// result. Picks an initial `current` match by scanning forward
+    /// from `from_page` (when `forward`) or backward (otherwise),
+    /// matching vim's `/` (forward) and `?` (reverse) semantics.
+    pub fn run_search(&mut self, query: &str, from_page: usize, forward: bool) {
+        let mut state = SearchState {
+            query: query.to_string(),
+            matches: Vec::new(),
+            current: None,
+            forward,
+            version: self.search.version.wrapping_add(1),
+        };
+        if query.is_empty() {
+            self.search = state;
+            return;
+        }
+        let n = self.pdf.page_count();
+        for page in 0..n {
+            match self.pdf.page_search(page, query) {
+                Ok(mut hits) => state.matches.append(&mut hits),
+                Err(e) => {
+                    tracing::warn!("page_search({page}, {query:?}): {e:#}");
+                }
+            }
+        }
+        state.current = pick_initial_match(&state.matches, from_page, forward);
+        self.search = state;
+    }
+
+    /// Step `n` (or back one with `N`) through the existing search
+    /// results. Returns the new current `MatchRect` if the search has
+    /// matches, otherwise `None`. `step_forward = true` is `n`,
+    /// `false` is `N` — it's not the *original* search direction, just
+    /// "which way do we want to go now."
+    pub fn step_search(&mut self, step_forward: bool) -> Option<MatchRect> {
+        let total = self.search.matches.len();
+        if total == 0 {
+            return None;
+        }
+        let next = match self.search.current {
+            None => {
+                if step_forward {
+                    0
+                } else {
+                    total - 1
+                }
+            }
+            Some(i) => {
+                if step_forward {
+                    (i + 1) % total
+                } else {
+                    (i + total - 1) % total
+                }
+            }
+        };
+        self.search.current = Some(next);
+        self.search.version = self.search.version.wrapping_add(1);
+        self.search.matches.get(next).copied()
+    }
+
+    /// Forget the active search (clears highlights). Returns true if
+    /// something was actually cleared, so callers can decide whether
+    /// they need a repaint.
+    pub fn clear_search(&mut self) -> bool {
+        if !self.search.is_active() && self.search.query.is_empty() {
+            return false;
+        }
+        self.search.clear();
+        true
     }
 
     /// Look up cached links for `page_idx`, querying mupdf and caching
@@ -215,6 +326,36 @@ pub enum ExplorerKind {
 impl ExplorerEntry {
     pub fn is_dir_like(&self) -> bool {
         matches!(self.kind, ExplorerKind::Dir | ExplorerKind::ParentDir)
+    }
+}
+
+/// Pick the index of the first match the cursor should land on. Matches
+/// vim's `/` semantics: forward search lands on the first hit at or
+/// after `from_page`, wrapping to the start if none exists; reverse
+/// search lands on the last hit at or before `from_page`, wrapping
+/// to the end.
+fn pick_initial_match(
+    matches: &[MatchRect],
+    from_page: usize,
+    forward: bool,
+) -> Option<usize> {
+    if matches.is_empty() {
+        return None;
+    }
+    if forward {
+        for (i, m) in matches.iter().enumerate() {
+            if m.page_idx >= from_page {
+                return Some(i);
+            }
+        }
+        Some(0)
+    } else {
+        for (i, m) in matches.iter().enumerate().rev() {
+            if m.page_idx <= from_page {
+                return Some(i);
+            }
+        }
+        Some(matches.len() - 1)
     }
 }
 

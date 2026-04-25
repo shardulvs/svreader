@@ -117,6 +117,10 @@ pub enum ParsedCommand {
     /// `:mouse on|off|toggle` — control mouse-click capture.
     MouseSet(bool),
     MouseToggle,
+    /// `:text` — extract every page's text and open the result in the
+    /// user's `$EDITOR`. The TUI handles the editor handoff so it can
+    /// suspend/restore raw mode around the spawn.
+    OpenTextEditor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +381,7 @@ fn parse_command(cmd: &Command, arg: &str) -> Result<ParsedCommand> {
             "toggle" | "" => Ok(ParsedCommand::MouseToggle),
             other => Err(anyhow!(":mouse wants on|off|toggle (got {other:?})")),
         },
+        "text" => Ok(ParsedCommand::OpenTextEditor),
 
         other => Err(anyhow!("command {other:?} has no handler")),
     }
@@ -722,6 +727,14 @@ fn all_commands() -> Vec<Command> {
             aliases: &[],
             description: "Mouse capture (on|off|toggle)",
             arg: CommandArg::OneOf(vec!["on", "off", "toggle"]),
+        },
+
+        // M3 — text & search.
+        Command {
+            name: "text",
+            aliases: &[],
+            description: "Open document text in $EDITOR",
+            arg: CommandArg::None,
         },
     ]
 }

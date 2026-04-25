@@ -101,6 +101,15 @@ pub struct PageLink {
     pub dest_point: Option<(f32, f32)>,
 }
 
+/// A search hit on a single page, in PDF user-space points
+/// (pre-rotation, pre-scale). One hit is one matched run of glyphs;
+/// multi-line wrapped matches surface as one rect each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchRect {
+    pub page_idx: usize,
+    pub rect: PdfRect,
+}
+
 /// A document that svreader can display. Kept tight and synchronous —
 /// implementations may not be `Send`/`Sync` (mupdf isn't), so callers
 /// hold one per thread.
@@ -132,6 +141,14 @@ pub trait Document: PageMetrics {
     /// excluded. Default impl returns an empty vec for backends that
     /// don't yet expose link annotations.
     fn page_links(&self, _page_idx: usize) -> Result<Vec<PageLink>> {
+        Ok(Vec::new())
+    }
+
+    /// Find every occurrence of `needle` on a single page. The search
+    /// is engine-defined — for mupdf it's a case-insensitive substring
+    /// match against the text-page's reading-order glyph stream.
+    /// Default impl returns no hits.
+    fn page_search(&self, _page_idx: usize, _needle: &str) -> Result<Vec<MatchRect>> {
         Ok(Vec::new())
     }
 }
