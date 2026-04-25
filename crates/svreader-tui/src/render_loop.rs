@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -98,11 +98,12 @@ pub fn run(opts: RunOptions) -> Result<()> {
 
     enable_raw_mode().context("enable_raw_mode failed")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, cursor::Hide)
+    execute!(stdout, EnterAlternateScreen, cursor::Hide, EnableFocusChange)
         .context("alt-screen enter failed")?;
 
     let res = run_inner(opts, pdf_path, &mut stdout);
 
+    let _ = execute!(stdout, DisableFocusChange);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = disable_raw_mode();
@@ -440,6 +441,11 @@ fn run_inner(
                 if app.mouse_enabled && matches!(app.mode, Mode::Normal) {
                     handle_mouse(&mut ws, &mut app, m, geom)?;
                 }
+            }
+            // tmux drops sixel images from inactive panes, so when the
+            // pane regains focus we force a repaint to re-emit them.
+            Event::FocusGained => {
+                app.full_repaint = true;
             }
             _ => {}
         }
@@ -1142,6 +1148,9 @@ fn drain_pending_events(
                 if app.mouse_enabled && matches!(app.mode, Mode::Normal) {
                     handle_mouse(ws, app, m, *geom)?;
                 }
+            }
+            Event::FocusGained => {
+                app.full_repaint = true;
             }
             _ => {}
         }
@@ -2534,6 +2543,7 @@ fn open_document_text_in_editor(ws: &Workspace) -> Result<()> {
     // mode, hide our cursor management, restore mouse-off so the
     // editor sees normal input.
     let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableFocusChange);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = disable_raw_mode();
@@ -2544,7 +2554,7 @@ fn open_document_text_in_editor(ws: &Workspace) -> Result<()> {
     // Reclaim the terminal.
     let _ = enable_raw_mode();
     let mut stdout2 = io::stdout();
-    let _ = execute!(stdout2, EnterAlternateScreen, cursor::Hide);
+    let _ = execute!(stdout2, EnterAlternateScreen, cursor::Hide, EnableFocusChange);
     // Mouse capture is re-enabled by the outer event-loop's full
     // repaint pass via set_mouse_capture's invariants — the
     // reader's `app.mouse_enabled` flag still says what we want.
